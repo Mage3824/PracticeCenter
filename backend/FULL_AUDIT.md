@@ -1,0 +1,702 @@
+# Полный аудит бэкенда WorkTime (Этап 1–2)
+
+**Дата:** 2026-11-04. **Режим аудита:** read-only (`dotnet build`/`test` не запускались — testhost и Kestrel в песочнице не стартуют, все выводы получены статическим чтением, glob и grep). После аудита внесены 5 исправлений (см. блок «После аудита внесены 5 исправлений» ниже и пункт «Что обязательно исправить»).
+
+**Что проверено:** `src/WorkTime.Domain`, `src/WorkTime.Application`, `src/WorkTime.Infrastructure`, `src/WorkTime.Api`, `tests/WorkTime.Tests`, `api-contracts.md`, `../docs/business_rules.md` (БП1..БП36), `../database/schema.sql`, конфигурация (`appsettings.json`, csproj), отсутствие артефактов DevOps по glob на весь `E:\AItest\progcentr`. Метод: 9 ланов (L1 архитектура, L2 безопасность, L3 производительность, L4 бизнес-логика, L5 качество кода, L6 готовность к EF Core/MySQL, L7 тестирование, L8 DevOps, R эталонные стандарты + веб-исследование) и три независимых верификатора: `verify_security.md`, `verify_architecture-db-devops.md`, `verify_business.md`.
+
+
+**Находки (полные записи):** Critical — 4, High — 24, Medium — 35, Low — 2 (всего 65).
+
+**После аудита внесены 5 исправлений** (2026-11-04, сборка чистая: 0 ошибок): JWT-ключ только из конфигурации с падением на старте (2.1), owner-check на завершении перерыва через BR21 (4.1), удаление `EntityMutationGates` и sync-over-async (3.2/3.3), rate limiting 5/мин на IP для `/login` (2.2), и DI-совместимость для Этапа 3 (6.1): интерфейсы репозиториев зарегистрированы `AddScoped` поверх `AddSingleton` concrete-dev-реализаций — internals in-memory репозиториев не тронуты (они под нож на Этапе 3), эти регистрации удаляются вместе с `AddDbContext` + `AddScoped` для EF Core. Остальные находки не исправлены.
+
+### Топ-10 до Этапа 3
+
+| slug | приоритет | суть |
+|---|---|---|
+| jwt-dev-key-in-repo-accepted-in-production | Critical | подписывающий ключ из `appsettings.json` принимается в Production, подделка `role=Admin` |
+| fake-repos-shipped-as-production-storage | Critical | InMemory-фейки зарегистрированы как боевое хранилище, комментарий слоя лжёт |
+| singleton-repos-vs-scoped-dbcontext | Critical | 9 singleton-репозиториев несовместимы с scoped `DbContext` |
+| sync-over-async-under-global-locks | High | `.GetAwaiter().GetResult()` под process-wide `lock`, токен теряется |
+| monthly-report-n-plus-one | High | ~6200 репозиторных вызовов + await в тройном вложенном цикле на один запрос |
+| break-finish-no-owner-check | Critical | `POST /api/breaks/{id}/finish` не проверяет владельца и роль (БП21/БП22) |
+| login-flood-no-rate-limiting | High | ни `AddRateLimiter`, ни лимита тела; Argon2 19 MiB на каждую попытку |
+| br32-session-resurrection-after-prune | High | «нет записи = не просрочено» + prune → idle-токен возвращается в строй |
+| token-not-revocable | High | нет `jti`/logout; деактивация и downgrade роли не инвалидируют выданный токен |
+| no-containerization-no-healthchecks | Medium | нет Dockerfile/compose/`.dockerignore` и `/health`, readiness для MySQL невозможен |
+
+## 1. Архитектура и паттерны проектирования
+
+### 1.1 InMemory-фейки поставляются как боевое хранилище — **Приоритет: Critical**
+
+**Проблема.** Все 9 `InMemory*Repository` живут в Production-проекте и зарегистрированы как прод: `src/WorkTime.Api/Program.cs:53-61` (9 × `AddSingleton`), `src/WorkTime.Infrastructure/DevRepositories.Users.cs:15`, `DevRepositories.WorkTime.cs:12,187`, `DevRepositories.Reports.cs:9,67`, `DevRepositories.Support.cs:9,132,192`. Комментарий границы `src/WorkTime.Infrastructure/InfrastructureLayer.cs:1-14` утверждает, что фейки «ушли в tests и не поставляются», но они в `WorkTime.Infrastructure` и инжектятся через `using WorkTime.Infrastructure` (`Program.cs:24`). В `tests/WorkTime.Tests` объявлены 9 одноимённых классов в global namespace (`InMemoryUserRepository.cs:5` и др.), код почти дословный дубль (`DevRepositories.Users.cs:26-40` vs `InMemoryUserRepository.cs:17-31`); namespaces разведены ради отсутствия ambiguity (`DevRepositories.Users.cs:7-9`).
+
+**Влияние/риск.** Боевой инстанс не персистентен: рестарт обнуляет все данные (BR29/BR30, BR24), «боевые» репозитории — тестовые словари, поэтому гонки, транзакции и constraints на Этапе 3 не проверяемы; два набора одной реализации расходятся молча.
+
+**Решение.** Перенести `DevRepositories.*` в `tests/WorkTime.Tests` (или в отдельный проект `WorkTime.Infrastructure.DevTier`), в `WorkTime.Infrastructure` оставить БД-реализации, `Program.cs:53-61` переключить на `AddDbContext` + `AddScoped`; дубль в tests удалить, тестовые фейки — один набор.
+
+**Ориентир:** [EF Core testing](https://learn.microsoft.com/en-us/ef/core/testing/)
+
+### 1.2 Use-case слой отсутствует: правила агрегатов в контроллерах — **Приоритет: Medium**
+
+**Проблема.** В `WorkTime.Application` только 5 сервисов (`Program.cs:64-68`); правила User/Department/PeriodClosure/Comment реализованы прямо в API: `src/WorkTime.Api/Controllers/UsersController.cs:90,93` (занятый логин), `:101` (BR34 хеш), `:161,203,230` + `:286-312` (BR20 «последний активный админ»), `AdminController.cs:72-92,111-128` (BR23), `ReportsController.cs:137-146` (BR13), `DepartmentsController.cs:84-91,131,153-169`. Уточнение верификатора: `IUserRepository` инжектят **все 8** контроллеров (`UsersController.cs:15`, `DepartmentsController.cs:15`, `AdminController.cs:23`, `ReportsController.cs:21`, `WorkDaysController.cs:21`, `AbsencesController.cs:21`, `BreaksController.cs:19`, `AuthController.cs:18`), а не «6 из 8».
+
+**Влияние/риск.** Одно правило живёт в двух слоях одновременно; правила покрываются только интеграционными тестами; HTTP-слой невозможно переиспользовать (Second API, CLI) и невозможно тестировать unit-тестами.
+
+**Решение.** Завести use-case сервисы (`UserService`, `DepartmentService`, `PeriodClosureService`, `CommentService`) в Application; контроллеры — только parse → сервис → wire; `TryGuardLastActiveAdmin` перенести в сервис под тот же гейт.
+
+**Ориентир:** [OWASP API Security](https://owasp.org/www-project-api-security/)
+
+### 1.3 Доменные сущности через границу Application→Api, DTO-слой мёртвый — **Приоритет: Medium**
+
+**Проблема.** Сервисы возвращают домен: `WorkTimeService.cs:40,86,131` → `WorkDay`, `BreakService.cs:28,86` → `Break`, `ReportService.cs:57` → `Report`, `AbsenceService.cs:28` → `Absence` (домен-свободны `AuthService.cs:26`, `ReportService.cs:126,199`, `AbsenceService.cs:90`). Конвертеры map'ят сущности напрямую: `Wire.cs:270,284,296,307,318`, `ManagementWires.cs:62,88,108,130`; `using WorkTime.Domain` в API: `Wire.cs:14`, `ManagementWires.cs:8`, контроллеры (`UsersController.cs:7`, `ReportsController.cs:9`, `DepartmentsController.cs:5`, `AdminController.cs:9`, `WorkDaysController.cs:8`, `AbsencesController.cs:7`). При этом `new WorkDayDto|BreakDto|ReportDto|AbsenceDto|AuditLogDto|UserDto|DepartmentDto|CommentDto|PeriodClosureDto` — **0 совпадений** во всём репо, включая tests, хотя параллельные пары конвертеров DTO/сущность существуют (`Wire.cs:254` vs `:270`, `:343` vs `:284`, `:355` vs `:296`, `:421` vs `:307`, `:443` vs `:318`, массивы `:332,366,432,457`; `ManagementWires.cs:62,77,88,97,108,119,130`).
+
+**Влияние/риск.** Контрактный DTO-слой из `api-contracts.md:30,72-74` — мёртвый код: рантайм отдаёт wire, собранный из сущностей; домен becomes wire-контракт, любое изменение сущности = breaking change API; двойной маппинг удваивает аллокации (см. 3.12).
+
+**Решение.** Либо удалить DTO-конвертеры и зафиксировать wire как единственный контракт, либо сделать DTO единственной точкой выхода: сервисы возвращают DTO из Application, конвертеры сущность→DTO живут в Infrastructure.
+
+### 1.4 Гейты мутаций в Application знают детали dev-репозитория — **Приоритет: Medium**
+
+**Проблема.** `src/WorkTime.Application/EntityMutationGates.cs:4-9` — три `static readonly object` (`Users`, `WorkTime`, `Absences`), `:14-17` `UserMutationLock.SyncRoot` открыт для API. Комментарий `:1-3` прямо говорит: гейты нужны, потому что dev-репозитории хранят **общие объекты сущностей в синглтонах**. Применение: `WorkTimeService.cs:115,154,194`, `BreakService.cs:128`, `AbsenceService.cs:56`, `AuthService.cs:76,103`, `UsersController.cs:157,201,228`.
+
+**Влияние/риск.** Application зависит от implementation detail конкретного dev-tier репозитория; с EF гейты ничего не защищают (см. 6.2/6.3), но останутся в коде как ложная «защита».
+
+**Решение.** Удалить гейты при переходе на EF; вместо process-wide замков — уникальные индексы + `RowVersion`/conditional UPDATE (см. 6.2, 6.3).
+
+### 1.5 `AuditTrail` — статический хелпер вместо сервиса — **Приоритет: Medium**
+
+**Проблема.** `src/WorkTime.Api/ManagementWires.cs:201-227` (`static AuditTrail`, вызов `:203`) — ровно 10 вызовов из 5 контроллеров: `UsersController.cs:112,180,208,235,267`, `DepartmentsController.cs:92,132,170`, `AdminController.cs:88,127`; второй путь — Application пишет `AuditLog` сам (`WorkTimeService.cs:174-175`).
+
+**Влияние/риск.** Статика невозможна для unit-тестов и для DI-подмены; два независимых пути записи аудита расходятся по полям (см. раздел «Что можно отложить»).
+
+**Решение.** `IAuditTrail` (Application) + реализация в Infrastructure, инъекция в контроллеры и сервисы; один формат записи.
+
+## 2. Безопасность и авторизация
+
+### 2.1 Подписывающий JWT-ключ из репозитории принимается в Production — **Приоритет: Critical**
+
+**Проблема.** Ключ коммитится: `src/WorkTime.Api/appsettings.json:3` — `SecretKey = "work-time-development-signing-key-change-me-please-32+-bytes"`, отдельного `appsettings.Production.json`, `UserSecretsId` или `.env` нет. `JwtSettings.cs:10-11` дублирует development-константу; `TryFromConfiguration` подменяет dev-ключ только когда ключ пуст (`:37-49`, `:52-64`), поэтому ветки не срабатывают; `ValidateSettings` (`:74-96`) сверяет непустоту/длину ≥32 байт (`:83-88`), Issuer/Audience (`:76-81`) и `ExpiryMinutes > 0` (`:90-95`), но **не** сравнение строки с dev-ключом и не окружение. Подпись и валидация используют один derivation `SHA256(UTF8(secret))`: `TokenService.cs:33-34` (подпись) и `TokenService.cs:77-78` (валидация); класс `JwtBearerSetup` объявлен в том же файле (`TokenService.cs:68`), отдельного `JwtBearerSetup.cs` в репозитории нет.
+
+**Влияние/риск.** Все среды подписывают публично известным ключом → offline brute force подписи, подделка `ClaimTypes.Role = "Admin"` и обход `AdminOnly`/`ManagerOrAdmin` (`AuthorizationPolicies.cs:52`), включая `AdminController.cs:133`, `UsersController.cs:317`.
+
+**Решение.** Секрет только из env/secret store + fail-fast на dev-значении:
+```csharp
+if (jwt.Key.Length < 32 || jwt.Key == JwtSettings.DefaultDevelopmentSecretKey)
+    throw new InvalidOperationException("JWT signing key must be >= 256 bits and not the dev key");
+// генерация: Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+```
+
+**Ориентир:** [OWASP JWT Cheat Sheet](https://github.com/OWASP/CheatSheetSeries/blob/master/cheatsheets/JSON_Web_Token_Cheat_Sheet.md), [RFC 7518 §3.2](https://www.rfc-editor.org/rfc/rfc7518#section-3.2)
+
+### 2.2 `/api/auth/login` без rate limiting, с тяжёлым KDF на каждую попытку — **Приоритет: High**
+
+**Проблема.** `AddRateLimiter`/`UseRateLimiter`/`EnableRateLimiting` — ноль совпадений по `src`; пайплайн `Program.cs:180-195` не содержит их. Единственный анонимный endpoint — `AuthController.cs:40-41`. Стоимость попытки: `PasswordHasher.cs:12-14` (`MemorySize = 19456` KiB, `Iterations = 2`), вызов на каждый промах с известным логином (`AuthService.cs:156` → `PasswordHasher.cs:89,91`); стоимость считается и при успехе (`AuthService.cs:73`). Уточнение верификатора: лимит тела не задан, но Kestrel по умолчанию принимает до **30 MB**, «неограниченный» неверно — фикс должен ставить ~64 KB (не 1 MB).
+
+**Влияние/риск.** CPU/RAM-усилитель под flood (19 MiB × 2 прохода на запрос), перебор паролей без ограничения, starvation threads (см. 2.3, 3.2).
+
+**Решение.** `AddRateLimiter` с partition по `IP + login` на auth-пути + `Limits.MaxRequestBodySize ≈ 64 KB`:
+```csharp
+builder.Services.AddRateLimiter(o => o.AddPartitionedFixedWindow(
+    p => $"{context.Connection.RemoteIpAddress}-{context.Request.Headers["Login"]}",
+    l => l.Permit = 5, l.Window = TimeSpan.FromSeconds(10)));
+app.UseRateLimiter();
+```
+Партition требует включённых `ForwardedHeaders` (см. раздел «Что можно отложить»).
+
+**Ориентир:** [ASP.NET Core rate limiting middleware](https://raw.githubusercontent.com/dotnet/AspNetCore.Docs/main/aspnetcore/performance/rate-limit.md)
+
+### 2.3 Enumerация аккаунтов + timing oracle на `/login` — **Приоритет: Medium**
+
+**Проблема.** Разные тексты отказа: `AuthService.cs:31-42` — «[RU] No account with this login.», `:136` — «[RU] Wrong password.»; KDF выполняется **только** для известного логина (`AuthService.cs:73`), поэтому ответ на неизвестный логин практически мгновенный; отказ возвращается как данные (HTTP 200, `AuthController.cs:55-57`), без 401/429.
+
+**Влияние/риск.** Дешёвый анонимный оракул «логин существует?» — по тексту и по времени ответа, до перебора паролей; усиливает 2.2.
+
+**Решение.** Единый текст «Неверный логин или пароль», фиктивная Argon2-верификация по эталонному хешу для неизвестного логина (выравнивание времени), счётчик неудач на partition (IP+login), `429` вместо «вечных 200».
+
+**Ориентир:** [OWASP API Security](https://owasp.org/www-project-api-security/)
+
+**2.4 Снято после сверки с требованиями: БП35/БП36 работают только для руковода и админа.** `.dsh-switchman/business-requirements.md:65-66` прямо: «(работает только для руковода и админа)», `api-contracts.md:262` — «manager/admin only». Ролевой гейт `lockRulesApply = Admin || Manager` (`AuthService.cs:107`) корректен и закреплен тестами `AuthServiceTests.cs:109-150` (`Login_EmployeeIsNeverLockedOrAskedForCaptcha`); менять запрещено. Осталось только расхождение документации: `docs/business_rules.md:66-67` эту оговорку не содержит — добавить её туда (долг документации, не дефект кода).
+
+### 2.5 Капча BR36 не проверяется сервером — **Приоритет: High**
+
+**Проблема.** `RequiresCaptcha` — только флаг в ответе (`AuthService.cs:127-132`, `Wire.cs:22`, маппинг `:240`); `LoginRequest` (`Requests.cs:27-34`) содержит только `login`/`password`, капча нигде не валидируется (grep по `src`). Нюанс: `api-contracts.md:430` прямо помечает это как известный пропуск этапа.
+
+**Влияние/риск.** Ограничение обходится повтором запроса без капчи; вместе с 2.2 перебор не замедляется вообще.
+
+**Решение.** Challenge/response-контракт: поле `captchaToken` в `LoginRequest`, генерация challenges (например SkiaSharp/буквенная картинка с TTL) + проверка на сервере до Argon2, повтор после порога BR36.
+
+### 2.6 Обход BR32: сессия «воскрешается» после prune — **Приоритет: High**
+
+**Проблема.** Отсутствие записи трактуется как «не просрочено» (`Middleware.cs:168-176`), а `TryPruneExpired` удаляет именно просроченные записи (`:185-204`) под `_pruneLock`, вызываясь только из `TryRecordActivity` (`:178-183`, throttled раз в `_limit` `:189-192`) — т.е. чужим аутентифицированным запросом или успешным входом (`AuthController.cs:71`). 401 выдаётся лишь когда запись есть и просрочена (`:236-260`), `finally` пишет новый baseline (`:264-271`).
+
+**Влияние/риск.** Idle-токен возвращается в строй: BR32 (8 ч неактивности) не действует для пользователей, чьи записи были удалены prune; 401 становится nondeterministic.
+
+**Решение.** Инвертировать семантику: нет записи ⇒ отказ (или записывать baseline при выдаче токена и не удалять просроченные без решения об отказе); хранить `lastActivity` вместе с `jti`, prune только после проверки.
+
+### 2.7 Токен не отзываема; деактивация и смена роли не инвалидируют его — **Приоритет: High**
+
+**Проблема.** Claims: `TokenService.cs:37-42` — `NameIdentifier`, `Role`, `Name`; ни `jti`, ни `nbf`, ни привязки к клиенту. Политики сравнивают только роль токена (`AuthorizationPolicies.cs:44-50`, поверх `ClaimTypes.Role` — `TokenService.cs:90-91`); middleware проверяет лишь наличие subject (`Middleware.cs:226-232`); `Identity.cs:59-72` резолвит `User`, но не смотрит `IsActive`; logout/signout нет (анонимен только `AuthController.cs:40-41`); деактивация — `UsersController.cs:213-234`, unlock `:249-250`.
+
+**Влияние/риск.** Захваченный токен воспроизводим до 8 ч; деактивированный или понижённый пользователь сохраняет доступ до истечения TTL (BR24 обходится).
+
+**Решение.** Дешёвый фикс точнее отзыва: контроллеры уже резолвят `User` (`Identity.cs:59-72`) — сверять `user.IsActive` и роль там же или в middleware; для настоящего отзыва — `jti` + revocation-хранилище и logout.
+
+**Ориентир:** [OWASP JWT Cheat Sheet](https://github.com/OWASP/CheatSheetSeries/blob/master/cheatsheets/JSON_Web_Token_Cheat_Sheet.md), [ASVS V3 Session Management](https://github.com/OWASP/ASVS/blob/master/4.0/en/0x12-V3-Session-management.md)
+
+### 2.8 Руководитель правит чужой текстовый отчёт без логирования — **Приоритет: High**
+
+**Проблема.** Класс-level `[Authorize]` (`ReportsController.cs:16`, action `:91` без политики), гейт `ReportService.cs:76` пропускает Manager на чужом дне; логирования по БП23 в action нет (`:96-106` — ни `AuditTrail`, ни role-ветки). Уточнение верификатора: нарушение — **БП23** (+БП21 по смыслу), а не БП22; БП22 (`../docs/business_rules.md:49`) запрещает руководителю правку часов и перерывов, право править текстовые отчёты с обязательным логированием принадлежит администратору (БП23, `:50`). Код исключения в сервисе — `BR21` (`ReportService.cs:78`), а не BR12.
+
+**Влияние/риск.** Правка чужого отчёта без следования требованию «обязательное логирование» (БП23) и без истории BR30.
+
+**Решение.** `[Authorize(Policy = AdminOnly)]` на edit + явная Manager-ветка только для комментариев; запись `AuditLog` (actor, old/new) в этом action. Контракт `api-contracts.md:478` объявляет endpoint 8 «аутентифицированным», поэтому смена политики меняет контракт (§7.3/§8) и требует правки контракта. Чтение чужого отчёта сотрудником уже закрыто корректно (`ReportService.cs:145-150`).
+
+### 2.9 Нет HTTPS-редиректа/HSTS; `AllowedHosts` — мёртвая настройка — **Приоритет: High**
+
+**Проблема.** Конвейер `Program.cs:180-195` не содержит `UseHttpsRedirection`/`UseHsts` (grep по `src` — ноль), нет CSP/заголовков безопасности; `appsettings.json:21` — `"AllowedHosts": "*"` при отсутствии `app.UseHostFiltering()` (grep — ноль). Контракт требует HTTPS (`api-contracts.md:23`).
+
+**Влияние/риск.** Bearer-токены (480 мин, не отзываемые — 2.7) идут по HTTP: перехват токена = полный угон сессии, включая Admin; нет защиты от downgrade; host-ограничение не работает вообще.
+
+**Решение.** `app.UseHsts()` вне Development + `app.UseHttpsRedirection()`, TLS на Kestrel/reverse-proxy; `UseHostFiltering()` с реальным списком или удаление `AllowedHosts`.
+
+**Ориентир:** [Enforce HTTPS in ASP.NET Core](https://learn.microsoft.com/aspnet/core/security/enforcing-ssl?tabs=visual-studio)
+
+### 2.10 DevSeed с фиксированными паролями, включая Admin — **Приоритет: Medium**
+
+**Проблема.** `src/WorkTime.Api/DevSeed.cs:22-28` — `admin/manager/employee` и `admin-password-1`, `manager-password-1`, `employee-password-1`; `NewUser` (`:64-75`) пишет их через `PasswordHasher.TryHash` (`:70`). Сид включается при `IsDevelopment() && IsManualRun()` (`Program.cs:171-177`, `:200-204`).
+
+**Влияние/риск.** Боевой хост, запущенный с `ASPNETCORE_ENVIRONMENT=Development` (сценарий, который 2.1 уже называет), получает реальную учётную запись Admin с публично известным паролем — вход без подделки токена; вместе с dev-ключом открыты оба пути.
+
+**Решение.** Dev-креденциалы генерировать случайно (`RandomNumberGenerator`) или из user-secrets и печатать в консоль; fail-fast при `Development` на боевом хосте.
+
+### 2.11 Swagger UI и schema анонимны и в Production — **Приоритет: Medium**
+
+**Проблема.** `app.UseSwagger()` + `UseSwaggerUI()` без env-гейта и до `UseAuthentication()` (`Program.cs:183-184`, auth на `:186`); комментарий `AuthorizationPolicies.cs:11-13` прямо говорит, что Swagger остаётся анонимным; фильтр `BearerSecurityRequirementOperationFilter` (`Program.cs:162`, класс `:210`) помечает Bearer-требования.
+
+**Влияние/риск.** Публичный `/swagger/v1/swagger.json` в Production: пути, схемы, ролевые требования; UI удобен для ручного перебора `/login` (2.2, 2.3).
+
+**Решение.** `if (!app.Environment.IsProduction()) { app.UseSwagger(); app.UseSwaggerUI(); }`.
+
+### 2.12 Нет политики пароля и предельной длины входных полей — **Приоритет: Medium**
+
+**Проблема.** `Requests.cs:27-34` — только `[Required]`, без `[MaxLength]`/сложности (БП34 требует лишь хеширования, `../docs/business_rules.md:65`); аналогично length-атрибуты отсутствуют для `text`/`fullName`/`name`/`reason` (`Requests.cs:27-85`, `Requests.Management.cs:7-67`) — бессмысленные тексты отчёта/имени принимаются, `[Required]` не ловит `"   "`.
+
+**Влияние/риск.** Неограниченная длина пароля увеличивает стоимость Argon2 на попытку (`PasswordHasher.cs:103` кодирует весь вход) и с дефолтным лимитом Kestrel 30 MB превращает `/login` в CPU/RAM-усилитель; слабые пароли принимаются при создании пользователя.
+
+**Решение.** `[MaxLength(1024)]` на login/password, политика сложности при создании пользователя, `[MinLength]/[MaxLength]` на text/name/reason, явный `Limits.MaxRequestBodySize ≈ 64 KB` для auth-пути.
+
+### 2.13 Аутентификационные события не пишутся в audit log — **Приоритет: Medium**
+
+**Проблема.** `AuthService.cs:103-137` — блокировки/капча/неудачные попытки только меняют `User` и возвращают флаги; ни одного вызова `AuditTrail`; единственный след — `LogWarning` в BR32 middleware (`Middleware.cs:238-239`).
+
+**Влияние/риск.** Brute-force и разблокировки (BR35) невосстановимы для incident response; BR30 покрывает только правки сущностей.
+
+**Решение.** Писать `LOGIN_FAILED` / `ACCOUNT_LOCKED` / `UNLOCKED` в `IAuditLogRepository` (или структурированные `ILogger`-события) с subject и actorId.
+
+## 3. Производительность и масштабируемость
+
+### 3.1 Месячный отчёт: N+1 с await в тройном вложенном цикле — **Приоритет: High**
+
+**Проблема.** `ReportService.cs:214` — `GetFinishedDaysForPeriodAsync(periodStart, periodEnd, ct)` возвращает дни **на всю систему** без фильтра по отделу/сотруднику; `:217` — отсутствия за период без фильтра; `:220` — сотрудники фильтруются по отделу (`GetActiveEmployeesInDepartmentAsync`). Вложенные циклы: `:224` (по сотрудникам) → `:249` (по всем дням периода) → `:263` `TryHasAbsenceOn` (линейный скан всех отсутствий, `:350-356`) → `:271` `await TrySumCountedBreakTimeAsync(workDay.Id, ct)` на каждую ячейку (`:316-323` — один репозиторный вызов + цикл по перерывам дня). Тот же путь — `ReportsController.cs:161` и `:184` (CSV/xlsx). Пачечный fetch перерывов в контракте отсутствует: `Interfaces/IRepositories.cs:86-88` — только `GetAllByIdsAsync`/`GetUnfinishedForEmployeeAsync`.
+
+**Влияние/риск.** 200 сотрудников × 31 день ≈ 6200 репозиторных вызовов на один запрос; на EF это 6200 roundtrip'ов к MySQL и секунды–минуты latency, без возможности отмены (см. 3.4).
+
+**Решение.** Один запрос с группировкой: дни и отсутствия фильтруются по сотрудникам периода, перерывы — одним `WHERE work_day_id IN (...)` с `GroupBy` по `work_day_id` (добавить `IBreakRepository.GetForWorkDaysAsync(ids, ct)`); агрегацию часов делать в SQL (`SUM`), не в памяти.
+
+### 3.2 Sync-over-async под глобальными мьютексами — **Приоритет: High**
+
+**Проблема.** 18 совпадений `GetAwaiter().GetResult()` — 16 под `lock` (границы проверены), 2 вне замка: `WorkTimeService.cs:115-126`, `:154-163`, `:194-212` (в т.ч. `:210` в цикле под lock), `BreakService.cs:128-147` (`:132,136,146`), `AbsenceService.cs:56-86` (`:60,69,84`), `AuthService.cs:76-82`, `:103-140` (`:81,139`), `UsersController.cs:157-177` (`:177`), `:201-206` (`:205`), `:228-234` (`:233`). Вне замка: `ReportService.cs:271` (await в тройном цикле месячного отчёта) и `UsersController.cs:294` (BR20-скан всех пользователей в `TryGuardLastActiveAdmin`, `:286-294`).
+
+**Влияние/риск.** Под глобальным замком поток пула блокируется во время чужой async-операции → starvation; в dev-tier все `Task` завершены синхронно, поэтому риск ограничен, но с EF становится реальным и добавляет deadlock-риск с `DbContext` (см. 6.1).
+
+**Решение.** Убрать мьютексы и sync-обёртки; целенаправленные async-методы репозитория с проброшенным токеном:
+```csharp
+await _workDays.MarkDayFinishedAsync(id, end, counted, ct);
+await _users.IncrementFailedAttemptsAsync(id, ct);
+```
+
+### 3.3 Process-wide мьютексы сериализуют throughput — **Приоритет: High**
+
+**Проблема.** `EntityMutationGates.cs:4-9` — три `static readonly object` на процесс; `UserMutationLock.SyncRoot = EntityMutationGates.Users` (`:14-17`). Горячие пути: `WorkTimeService.cs:115/154/194`, `BreakService.cs:128`, `AbsenceService.cs:56`, `AuthService.cs:76/103`, `UsersController.cs:157/201/228` (BR20-скан всех пользователей `:286-294` выполняется вне замка).
+
+**Влияние/риск.** Все пользователи мира ждут друг друга на `FinishWorkDay`; на БД гейт ничего не защищает на 2+ инстансах; связное усиление — 3.2.
+
+**Решение.** Удалить гейты; конкурентность перенести в БД (уникальные индексы + rowversion, см. 6.2/6.3); BR20 — подсчёт `CountAsync(role=Admin && IsActive)` в той же транзакции.
+
+### 3.4 `CancellationToken` не исполняется ни в одной реализации — **Приоритет: Medium**
+
+**Проблема.** grep по `src` — ноль `ThrowIfCancellationRequested`, ни одна реализация не использует токен (`DevRepositories.Users.cs:19-23`, `DevRepositories.Support.cs:21-24`, `DevRepositories.Reports.cs:13-16`). Уточнение верификатора: сигнатур с `CancellationToken` в Infrastructure не 90, а **57**.
+
+**Влияние/риск.** EF без токена не отменяет запрос в MySQL; тяжёлый месячный отчёт (3.1) не прерывается при abort, BR32-timeout не спасает соединения.
+
+**Решение.** Пробрасывать `ct` в `QueryAsync`/`ExecuteAsync` и в `SaveChangesAsync(ct)`; в long-running методах проверять `ct.ThrowIfCancellationRequested()` в циклах.
+
+**Ориентир:** [EF Core saving/concurrency and async](https://learn.microsoft.com/en-us/ef/core/saving/concurrency?tabs=data-annotations)
+
+### 3.5 Audit log без bounding и без страниц — **Приоритет: Medium**
+
+**Проблема.** `DevRepositories.Support.cs:134` — `Dictionary<Guid, AuditLog>` без eviction; `GetHistoryForEntityAsync` (`:160-172`) сканирует весь словарь и возвращает всю историю сущности без страниц; `AdminController.cs:41-56` — `GET /api/audit-logs` отдаёт весь массив (`entityId` обязателен `:48-53`, доступ `AdminOnly` `:16`). Записи добавляются на критические действия (`UsersController.cs:208-209`, `DepartmentsController.cs:92-94`, `WorkTimeService.cs`, `ManagementWires.cs`).
+
+**Влияние/риск.** Хранение 1 год по БП29 не обеспечено; ответ растёт линейно с числом правок; на EF — полный скан таблицы без `ORDER BY`/`LIMIT`.
+
+**Решение.** `page`/`pageSize` в контракте + retention-джоб (1 год) + `OrderByDescending(Timestamp)` (см. 3.12).
+
+**Ориентир:** [OWASP API Security](https://owasp.org/www-project-api-security/)
+
+### 3.6 Plain `Dictionary` в singleton-репозиториях без внешнего гейта — **Приоритет: High**
+
+**Проблема.** Plain `Dictionary` подтверждён: `DevRepositories.Users.cs:17`, `:130`; `DevRepositories.Support.cs:11`, `:134`, `:194`; `DevRepositories.Reports.cs:11`, `:69`; эталон `ConcurrentDictionary` — `DevRepositories.WorkTime.cs:16`, `:189` и трекер `Middleware.cs:154`. Внешний гейт на структурные Add/Remove отсутствует: замки только в сервисах и `UsersController.cs:157/201/228`; `DepartmentsController.cs:91` — `SaveAsync` без lock (`:87-94`), `ReportsController.cs` и `AdminController.cs` без замков. Уточнение верификатора: CRUD пользователей защищён `UserMutationLock.SyncRoot`, поэтому «без lock» верно для departments/reports/audit/closures и для создания пользователя, но не для users; WorkDay/Break — `ConcurrentDictionary`, поэтому заявленный `InvalidOperationException` там неверен (реальный риск — «слабое» перечисление, guard BR1 может не увидеть только что добавленный день).
+
+**Влияние/риск.** Конкурентный Add/Remove во время enumerate портит бакеты `Dictionary` (известное поведение, вплоть до бесконечного rehash); «неувиденный» день → пропуск BR1.
+
+**Решение.** `ConcurrentDictionary` во всех репозиториях либо гейт на структурные изменения; на Этапе 3 проблема снимается переходом на БД (см. 6.1).
+
+### 3.7 In-memory состояние блокирует горизонтальное масштабирование — **Приоритет: High**
+
+**Проблема.** 9 репозиториев-синглтонов (`Program.cs:53-61`) + `UserActivityTracker` singleton (`:93-94`); `IDistributedCache`/Redis/response compression не зарегистрированы (grep — ноль). Уточнение верификатора: утверждение про сид неверно — `Program.cs:171-177` выполняется только при `IsDevelopment() && IsManualRun()` (`:200-204`), т.е. на боевом инстансе сид не пишется. Остальное верно: BR32 считается per-process (`Middleware.cs:152-204`, `:266-270`), BR20 — process-wide мьютексом (`EntityMutationGates.cs:4-9`, `UsersController.cs:286-300`).
+
+**Влияние/риск.** 2 инстанса: сессия живёт на одном, данные — на каждом; load balancing даёт 401 на половине запросов; BR20/BR35 обходятся между инстансами.
+
+**Решение.** Этап 3: БД как единственный shared-state; BR32 — распределённый трекер (`IDistributedCache`/Redis) или сверка `exp`/последней активности в БД; BR35/BR36 — partition по user в rate limiter.
+
+### 3.12 Двойная копия при wire-маппинге и отсутствие пагинации/упорядочения — **Приоритет: Medium**
+
+**Проблема.** Wire-конвертеры собирают `List`, затем `ToArray()` — двойная копия каждого элемента (`Wire.cs:332-341`, `:369`, `:435`, `:460`; `ManagementWires.cs:80`, `:100`); list-эндпоинты без пагинации: `UsersController.cs:46` (все пользователи), `DepartmentsController.cs:39` (все отделы), `AbsencesController.cs:110-118` (весь диапазон дат), `ReportsController.cs:85` (полная матрица). Упорядочение отсутствует: `GetHistoryForEntityAsync` (`DevRepositories.Support.cs:160-175`) не сортирует (порядок = insertion-order словаря, а БП30 требует хронологии), `GetByWorkDayIdAsync` (`DevRepositories.WorkTime.cs:220-235`) и `GetAllForWorkDayAsync` (`DevRepositories.Reports.cs:103-115`) тоже.
+
+**Влияние/риск.** Ответы и аллокации растут без границ; нестабильный порядок перерывов/комментариев в ответах API и в истории BR30.
+
+**Решение.** Возвращать массив прямо из LINQ (`Select(...).ToArray()`), добавить `page`/`pageSize` (по умолчанию 200) в GET-контракты и репозитории, и `OrderByDescending(Timestamp)`/`OrderBy(...)` для истории, перерывов и комментариев.
+
+## 4. Бизнес-логика и граничные случаи
+
+### 4.1 `POST /api/breaks/{breakId}/finish` без проверки владельца и роли — **Приоритет: Critical**
+
+**Проблема.** Метод не принимает `employeeId`: `BreaksController.cs:58-62`, `BreakService.cs:86-149`; контракт молчит (`api-contracts.md:76`, `:477`); в сервисе нет owner-gate и ролевой проверки (класс-level `[Authorize]`, action без политики).
+
+**Влияние/риск.** Любой аутентифицированный (в т.ч. другой сотрудник) закрывает чужой перерыв; руководитель правит перерывы вопреки БП22; BR21 полностью отсутствует на пути; часы чужого дня меняются без аудита.
+
+**Решение.** Взять `employeeId` из токена (`RequestIdentity.TrySubjectUserId`, `Identity.cs:13-15`) и добавить owner-gate в `FinishBreakAsync` (409 BR21 для чужого дня) + BR21 в контракт; для Manager/Admin — отдельная политика с логированием (БП23).
+
+### 4.2 БП1: после `finish` тот же день открывается повторно — **Приоритет: High**
+
+**Проблема.** `GetActiveForEmployeeOnDateAsync` фильтрует только `Status == Active` (`src/WorkTime.Infrastructure/DevRepositories.WorkTime.cs:140-163`, сравнение даты `:156`), поэтому старт после завершения создаёт **второй** `WorkDay` на ту же дату (`:151`), и часы складываются в месячной матрице (`ReportService.cs:276-283`). Гонка усиливает: `StartWorkDayAsync` пишет без lock (`WorkTimeService.cs:82`), проверка BR1 на `:62-68`.
+
+**Влияние/риск.** Две смены за сутки (против БП1), итог месячного отчёта завышен; два активных дня при параллельных POST, один из них висает незакрытым.
+
+**Решение.** Уникальный индекс на БД `(user_id, work_date)` для «одна смена на дату» (см. 6.2) + перевод `DbUpdateException` в BR1; guard на дату брать из той же транзакции.
+
+### 4.3 БП3: авто-закрытие 23:59:59 отсутствует — **Приоритет: High**
+
+**Проблема.** Триггера нет: grep `IHostedService|BackgroundService|Timer` по `src` → ноль (только комментарии `WorkTimeService.cs:3,130`, `WorkDaysController.cs:113`). Есть ручная ручка `WorkDaysController.cs:114-127` и запись «Auto-finish» (`WorkTimeService.cs:166-178`). Уточнение верификатора (REJECTED-часть): открытая смена на дату D **не** мешает старту на D+1 (`DevRepositories.WorkTime.cs:156` сравнивает дату) — корректная формулировка: открытая смена остаётся `Active` и не попадает в месячный отчёт (`DevRepositories.WorkTime.cs:61-64`), это и есть нарушение БП3/БП15.
+
+**Влияние/риск.** Открытые смены висают `Active`, их часы теряются в отчётности (БП15), БП7/БП9 для открытых перерывов не пересчитываются.
+
+**Решение.** `IHostedService` (Этап 4), которая в 23:59:59 локальной TZ вызывает `AutoFinishWorkDayAsync` (см. 8.3 для TZ); при старте дня — закрытие «вчерашних» открытых смен тем же методом.
+
+### 4.4 БП21 отсутствует в auto-finish — **Приоритет: High**
+
+**Проблема.** `AutoFinishWorkDayAsync` не сравнивает `UserId` (`WorkTimeService.cs:131-147`), endpoint `WorkDaysController.cs:118-126`; контракт (`api-contracts.md:75`) перечисляет коды без BR21, поэтому контракт и код вместе оставляют дыру.
+
+**Влияние/риск.** Любой аутентифицированный пользователь закрывает чужую смену; BR30-автор записи неверен (см. раздел «Что можно отложить»).
+
+**Решение.** Owner-gate в `AutoFinishWorkDayAsync` (409 BR21), `Policy = EmployeeOnly` на ручку, BR21 в контракт.
+
+### 4.5 БП35: «10 неудачных попыток за сутки» не выполняется — **Приоритет: High**
+
+**Проблема.** Счётчик — бегущий итог и сбрасывается при успешном входе (`AuthService.cs:78-80`, `:105`), сброса по календарному дню нет; ветка «до конца дня» на `:109-118` (`WorkTimeRules.cs:12`) достижима только 10 подряд; контракт сам помечает как reserved (`api-contracts.md:429`). Инкремент read-modify-write под process-wide lock (`AuthService.cs:103-139`, `SaveAsync` `:139`).
+
+**Влияние/риск.** Успешные входы между неудачами обнуляют счётчик → блокировка «до конца дня» недостижима; на БД два параллельных логина теряют инкремент (lost update).
+
+**Решение.** Сбрасывать `FailedLoginAttempts` по календарному дню (окно суток) и считать атомарно (см. 6.3 `ExecuteUpdate`).
+
+**Ориентир:** [OWASP WPTG — Weak Lock-Out Mechanism](https://owasp.github.io/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/04-Authentication/03-Weak_Lock_Out_Mechanism)
+
+### 4.6 БП14: отчёт не формируется автоматически при завершении дня — **Приоритет: Medium**
+
+**Проблема.** `FinishWorkDayAsync` (`WorkTimeService.cs:86-128`) и `AutoFinishWorkDayAsync` (`:131-180`) не вызывают `ReportService`; отчёт создаётся только по `POST /api/reports/{workDayId}` (`ReportService.cs:83-91`, 409 BR14; `api-contracts.md:77`); незавершённый день → `null` 200 (`ReportService.cs:152-155`, `ReportsController.cs:58-66`).
+
+**Влияние/риск.** «Отчёт формируется автоматически после завершения дня» не выполняется; если клиент не POST'ит, BR15/БП16 показывают пустую строку.
+
+**Решение.** Вызвать `CreateOrUpdateReportAsync` из `FinishWorkDayAsync`/`AutoFinishWorkDayAsync` в той же транзакции (см. 6.4).
+
+### 4.7 БП12 недостижим; БП23 — нет правок часов/перерывов и логирования — **Приоритет: High**
+
+**Проблема.** Отчёт создаётся только после завершения дня (`ReportService.cs:83-91`, BR14), а правка закрытого дня запрещена не-админу (`:106-113`, BR12) → ветка «до конца текущего рабочего дня» недостижима. Правка времени начала/окончания и перерывов отсутствует как эндпоинт (`WorkDaysController.cs:43-130`, `BreaksController.cs:33,53`); логирование изменений (БП23 «обязательное логирование») отсутствует.
+
+**Влияние/риск.** BR12 не может сработать вообще; БП23/БП23.2 («экстренная корректировка» с грифом, `AdminController.cs:129`) физически невыполнимы: гриф пишется, но изменить нечего.
+
+**Решение.** Реализовать `PUT /api/work-days/{id}/times` и `PUT /api/breaks/{id}` под `AdminOnly` с обязательной причиной и `AuditLog` (old/new), БП23.2; для БП12 — создать отчёт в момент старта/завершения и разрешить правку сотруднику до конца дня.
+
+### 4.8 БП23.1: закрытие периода не блокирует редактирование — **Приоритет: High**
+
+**Проблема.** Сущность и close/reopen есть (`AdminController.cs:61-131`), но `IsClosed` нигде не блокирует правку: в сервисах проверка закрытия периода отсутствует (grep `IsClosed` → домен, wire, repo, close/reopen); повторное close → 409 BR23.1, reopen незакрытого → 409 BR23.2 (`AdminController.cs:78-83`, `:117-122`).
+
+**Влияние/риск.** «Отчётный период закрыт» не останавливает правку отчётов/отсутствий — BR23.1 обходится после закрытия.
+
+**Решение.** Проверять `IPeriodClosureRepository.GetForPeriodClosureAsync(departmentId, year, month).IsClosed` в `ReportService`/`AbsenceService`/`WorkTimeService` перед мутацией (409 BR23.1).
+
+### 4.9 БП4/БП7: отрицательная длительность принимается молча — **Приоритет: High**
+
+**Проблема.** Нет проверки `endTime >= startTime`: ни в запросе (`Requests.cs:47-51` — только regex формата), ни в сервисе; формула верна (`WorkTimeService.cs:218-239`, `ReportService.cs:268-272`). Следствия: `endTime` < `StartTime` дня → 200, `CountedInReports = false`, отрицательные минуты в daily report (`ReportService.cs:166`, `DailyReportWire.totalMinutes`); пересечение полуночи не поддержано — finish payload не содержит дату (`Requests.cs:47-51`), закрытие «вчерашней» смены сегодня даёт отрицательную длительность, а авто-закрытия (БП3), которая должна это разрешать, нет; авто-закрытие открытого перерыва моментом `endTime` раньше его старта → `Duration < 0`, `EndTime < StartTime` (`WorkTimeService.cs:194-211`).
+
+**Влияние/риск.** Отрицательные часы в отчётах и в сумме месяца; BR9 после авто-закрытия не пересчитывается.
+
+**Решение.** Валидация `endTime >= startTime` в сервисе (400/BR4) + поддержка «закрытие вчерашней смены» (дата finish или нормализация через авто-закрытие БП3); пересчитать `CountedInReports` после закрытия перерывов.
+
+### 4.16 БП18: произвольный период не поддержан — **Приоритет: Medium**
+
+**Проблема.** Окно берётся из месяца закрытия (`ReportService.cs:210-211`, `:296-312`); `export.xlsx` без параметров (`ReportsController.cs:184-200`, 501 `EXPORT_NOT_IMPLEMENTED`). Уточнение верификатора: «расхождение контроллер↔контракт» неверно — контракт внутренне противоречив (`api-contracts.md:83` «query как у эндпоинта 9» против `:489` «нет параметров»), код следует §10; CSV-экспорт с query документирован (`api-contracts.md:488`) и реализован (`ReportsController.cs:164-180`). Реальная дыра — БП18.
+
+**Влияние/риск.** Отчёт за произвольный период (БП18) невозможен; BR17 (Excel) — 501.
+
+**Решение.** Принять `dateFrom`/`dateTo` в обоих экспортах и в месячном отчёте, унифицировать контракт (§2 vs §10), Excel реализовать на Этапе 4.
+
+## 5. Качество кода и поддерживаемость
+
+### 5.1 Мёртвый примитив `GetAllByIdsAsync(Dictionary<Guid, Guid>)` — 8 интерфейсов, 17 реализаций, 0 вызовов — **Приоритет: Low**
+
+**Проблема.** Объявлен в 8 интерфейсах (`src/WorkTime.Application/Interfaces/IRepositories.cs:14,39,56,86,103,129,148,163` — `IComment` без него), вызовов — ноль во всём репо; реализаций **17** (9 dev + 8 tests): 16 интерфейсных + 1 вне интерфейса (`DevRepositories.Reports.cs:86` у `InMemoryCommentRepository`); комментарий про неиспользуемые значения — `tests/InMemoryUserRepository.cs:15`.
+
+**Влияние/риск.** 17 реализаций support-кода с бессмысленной подписью `Dictionary<Guid, Guid>` (пара value не используется) разрастается на Этапе 3 как EF-реализации; контракт репозиторием вводит в заблуждение.
+
+**Решение.** Заменить на `Task<T[]> GetAllByIdsAsync(IEnumerable<Guid> ids, CancellationToken ct)` или удалить; при удалении — один проход по 8 интерфейсам и обеим sets реализаций.
+
+### 5.2 Однотипная обвязка «стоп-сигнал / субъект / известный пользователь» во всех 8 контроллерах — **Приоритет: Medium**
+
+**Проблема.** `TryStopSignal`/`TrySubjectUserId`/`TryRequireKnownUserAsync` повторяются в каждом action: `WorkDaysController.cs:50-55,71-74,88-91,120-123,136-139`, `UsersController.cs:72-74,126-128,193-195,220-222,255-257` и т.д.; `IUserRepository` инжектят все 8 контроллеров; экшенов **35** (`[Http*]` grep), не 32; `AuthController.cs:46` делает только `TryStopSignal` без триады.
+
+**Влияние/риск.** Дuplicated guard-код на 35 action'ах; расхождения в порядке проверок (404 vs 403 vs 401) между контроллерами; правка BR21/BR27 должна повторяться 35 раз.
+
+**Решение.** Перенести триаду в middleware/фильтр (`RequestGuardFilter`) или в базовый класс контроллера: один fetch субъекта в `HttpContext.Items` (см. раздел «Что можно отложить»), отказ через `ProblemDetails`; в контроллере остаётся только бизнес-вызов.
+
+### 5.3 `POST` и `PUT` в `AbsencesController` — два идентичных тела — **Приоритет: Medium**
+
+**Проблема.** `AbsencesController.cs:44-57` vs `:66-78` — тела идентичны (разница только комментарий `:54`).
+
+**Влияние/риск.** Два пути для одного правила BR28: правка одного без второго → расхождение поведения и контракта; оба требуют `ManagerOrAdmin`.
+
+**Решение.** Один обработчик (`SetAbsence`) + `[HttpPut]`/`[HttpPost]` как alias с одинаковым контрактом, либо удалить POST и зафиксировать PUT в контракте.
+
+### 5.4 Маппинг сущность→wire продублирован «сущность» и «DTO» и локально в контроллере — **Приоритет: Medium**
+
+**Проблема.** Две цепочки в `Wire.cs` (пары `:254`/`:270`, `:343`/`:284`, `:355`/`:296`, `:421`/`:307`, `:443`/`:318`), локальный маппер в `AbsencesController.cs:114`, форматные решения дублированы: `Wire.cs:153-155` + `enum .ToString()` в обеих цепочках (`:262`/`:278`, `:313`/`:323`, `:427`/`:448`).
+
+**Влияние/риск.** Формат контракта (дата, HH:mm, enum-имена) задаётся в 3 местах → расхождение wire-ответов при правке формата; двойные аллокации (см. 3.12).
+
+**Решение.** Один центр маппинга: `WireConversion` + `WireFormats` (`WireFormats.cs:151-230` уже единый центр скалярных форматтов), локальный маппер удалить, DTO-цепочки убрать вместе с мёртвым DTO-слоем (1.3).
+
+### 5.5 DTO не immutable: публичные set-ы, mutable коллекции, доменные enum, `DateTime` без tz — **Приоритет: Medium**
+
+**Проблема.** Все DTO — `public class` с get/set (`src/WorkTime.Application/Dto/*`); mutable `List`/`Dictionary` (`Dto/Reports.cs:10,27,33`); доменные enum в DTO (`UserDto.cs:12`, `AbsenceDto.cs:11`, `AuditLogDto.cs:11`); lockout-поля в `UserDto.cs:20-25`; `DateTime` без tz, wire отдаёт «без timezone suffix» (`Wire.cs:5-7`, `:155`, `Wire.cs:164-166`).
+
+**Влияние/риск.** DTO как mutable-перенос данных допускает скрытые мутации после ответа; доменные enum в контракте = breaking change при изменении `Enums.cs`; отсутствие tz в timestamps конфликтует с BR32/BR30 (см. 6.6).
+
+**Решение.** DTO как `record` с init-only свойствами, `IReadOnlyList<>`, собственные wire-enum (строки) вместо доменных, `DateTimeOffset`/ISO-8601 с offset в контракте.
+
+### 5.6 NRT-гигиена: предупреждения не становятся ошибками, есть null-forgiving — **Приоритет: Medium**
+
+**Проблема.** В csproj только `Nullable=enable` (`WorkTime.Api.csproj:6`, `WorkTime.Application.csproj:15`); нет `TreatWarningsAsErrors`, `WarningsAsErrors`, `GenerateDocumentationFile`, `EnforceCodeStyleInBuild`, анализаторов (grep по `*.csproj` = 0); `text!.Split(':')` (`Requests.cs:113`), `return text!` (`:171`), `[Required]` на `string?` (`Requests.cs:29-33+`, `Requests.Management.cs:9-24`), `payload.text!` (`ReportsController.cs:105`); `#pragma`/`SuppressMessage` — 0.
+
+**Влияние/риск.** Null-warnings тихо копятся и не блокируют сборку; `!` маскирует реальные null-пути (валидация проходит, а сервис получает null).
+
+**Решение.**
+```xml
+<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+<WarningsAsErrors>CS8600;CS8602;CS8603;CS8604</WarningsAsErrors>
+<GenerateDocumentationFile>true</GenerateDocumentationFile>
+<EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+```
++ `PackageReference Microsoft.CodeAnalysis.NetAnalyzers`; вместо `!` — явный parse с отказом (400/`FIELD_MISSING`).
+
+
+### 5.7 Бизнес-константы разбросаны и продублированы вне `WorkTimeRules` — **Приоритет: Medium**
+
+**Проблема.** Пороги живут одновременно в Domain (`src/WorkTime.Domain/WorkTimeRules.cs:10,12,14`) и в сервисах (`AuthService.cs:22,24` — `WrongPasswordsToLock`, `LockDuration`), границы перерывов/минут — в `BreakService`/`WorkTimeService`, окно BR32 — в `JwtSettings.ExpiryMinutes` (`JwtSettings.cs:13-14`) и `Middleware.cs:154-163`; политика API при этом заявляет единство правил (комментарий `InfrastructureLayer.cs:1-14`).
+
+**Влияние/риск.** Правка порога (например BR35 5→3) требует изменений в 2+ местах; расхождение Domain ↔ API молча меняет поведение и контракты.
+
+**Решение.** Все пороги и тексты правил — в `WorkTimeRules`/`BusinessRuleConstants` (Domain), сервисы и middleware читают только оттуда; тесты на константы.
+
+### 5.8 Нет логирования в Application-сервисах; статические хелперы блокируют наблюдаемость и unit-testability — **Приоритет: Medium**
+
+**Проблема.** Сервисы (`WorkTimeService`, `BreakService`, `ReportService`, `AbsenceService`, `AuthService`) не принимают `ILogger`; единственный sink — API middleware (`Program.cs:47-49`, `Middleware.cs:291-296`); статика `EntityMutationGates` (`:4-9`) и `AuditTrail` (`ManagementWires.cs:201-227`).
+
+**Влияние/риск.** Правило, отказавшее в сервисе (BR-код), не попадает в лог с контекстом; unit-тесты не могут подменить гейт/аудит; диагностику BR-отказов нельзя связать с запросом (см. 8.4).
+
+**Решение.** `ILogger<T>` в конструкторы сервисов, `IAuditTrail`/`IClock` как интерфейсы (см. 1.5), структурированные события с BR-кодом.
+
+## 6. Подготовка к Этапу 3 (база данных)
+
+### 6.1 DI: singleton-репозитории против scoped `DbContext` — **Приоритет: Critical**
+
+**Проблема.** Все 9 репозиториев — `AddSingleton` (`Program.cs:53-61`), сервисы — `AddScoped` (`:64-68`, `TokenService :71`, `RequestContextProvider :76`); сид резолвит репозиторий из root provider (`Program.cs:174-175` под guard `IsDevelopment && IsManualRun` `:171`). EF Core: `DbContext` не thread-safe и должен жить на запрос; повторный `GetByIdAsync` в scoped контексте возвращает тот же tracked-экземпляр, поэтому «изменили и `SaveAsync`» становится implicit update.
+
+**Влияние/риск.** С EF текущая регистрация неработоспособна: shared `DbContext` на весь процесс, сид с scoped репозиторием бросает исключение (или создаёт контекст вне запроса), мутация detached-entities (`WorkTimeService.cs:115,154,194` правят объект из store) не сохраняется; sync-over-async под lock (3.2) добавляет deadlock-риск.
+
+**Решение.**
+```csharp
+builder.Services.AddDbContext<ApplicationDbContext>(o =>
+    o.UseMySql(cs, ServerVersion.AutoDetect(cs)));   // или AddDbContextFactory для фоновых сервисов Этапа 4
+builder.Services.AddScoped<IWorkDayRepository, EfWorkDayRepository>();   // все 9 — scoped
+```
+Сид — отдельный `IDataSeedInitializer` после `db.Database.MigrateAsync()` в Development (см. раздел «Что можно отложить»); при `EnableRetryOnFailure` пользовательские транзакции обёртывать `ExecutionStrategy.Execute`.
+
+**Ориентир:** [Pomelo Configuration Options](https://github.com/PomeloFoundation/Pomelo.EntityFrameworkCore.MySql/wiki/Configuration-Options)
+
+### 6.2 TOCTOU-гонки: SELECT-then-write вместо уникальных индексов — **Приоритет: High**
+
+**Проблема.** `WorkTimeService.cs:62-63` (`GetActiveForEmployeeOnDateAsync`) → проверка `openDays.Count > 0` → `:82` `SaveAsync` вне lock; `ReportService.cs:81` → `existing == null` → `:102` insert / `:118` update; `AbsenceService.cs:56-71` → `:84` insert; `AdminController.cs:84-87`, `:126`; `DepartmentsController.cs:153-169`. Уточнение верификатора: `users.Login UNIQUE` уже есть в `../database/schema.sql:15`, поэтому позиция «users.Login» избыточна; реально отсутствуют комбинации `work_shifts(user_id,work_date)` (`schema.sql:55-68`), `absences(user_id,absence_date)` (`:42-51`), `accounting_periods(department_id,year_num,month_num)` (`:31-38`).
+
+**Влияние/риск.** На БД lock ничего не защищает: два открытых дня на дату, два отчёта на день, два отсутствия, race на удалении отдела.
+
+**Решение.** Добавляемые unique-индексы (MySQL нет partial unique — либо `(user_id, work_date, status)`, либо generated column `open_key = IF(status=0, work_date, NULL)`):
+```csharp
+b.ToTable("work_days").HasIndex(e => new { e.UserId, e.Date, e.Status }).IsUnique();
+b.ToTable("reports").HasIndex(e => e.WorkDayId).IsUnique();
+b.ToTable("absences").HasIndex(e => new { e.UserId, e.Date }).IsUnique();
+b.ToTable("period_closures").HasIndex(e => new { e.DepartmentId, e.Year, e.Month }).IsUnique();
+```
+Ловить `DbUpdateException` (duplicate key) и translate в `BusinessRuleException("BR1"/"BR14"/"BR28"/"BR23")`, а не полагаться на предварительный SELECT.
+
+### 6.3 Optimistic concurrency отсутствует; счётчик BR35 — lost update — **Приоритет: High**
+
+**Проблема.** Сущности без версии (`Entities.cs:28-36`, `:96-115`); grep `RowVersion|Concurrency|DbUpdateException` по репо = 0. Два `FinishWorkDay` сейчас защищены только мьютексом; инкремент BR35 — read-modify-write (`AuthService.cs:105` под lock `:103`, полный `SaveAsync` `:139`).
+
+**Влияние/риск.** На БД: второй UPDATE проходит, BR2/BR4 не срабатывают; два параллельных логина теряют инкремент; close/reopen периода теряют запись.
+
+**Решение.**
+```csharp
+public uint RowVersion { get; set; }          // WorkDay, PeriodClosure, Absence, Report
+b.Property(e => e.RowVersion).IsConcurrencyToken().HasDefaultValueSql("CURRENT_TIMESTAMP(6)");
+// либо условный UPDATE: UPDATE work_days SET ... WHERE status = 0 AND end_time IS NULL, проверить affected rows
+await _dbContext.Users.Where(u => u.Id == id)
+    .ExecuteUpdate(s => s.SetProperty(u => u.FailedLoginAttempts, u => u.FailedLoginAttempts + 1));
+```
+Ловить `DbUpdateConcurrencyException` в репозитории и поднимать доменный exception (BR2/BR4).
+
+**Ориентир:** [EF Core concurrency](https://learn.microsoft.com/en-us/ef/core/saving/concurrency?tabs=data-annotations)
+
+### 6.4 Аудит и бизнес-операция не атомарны: нет UnitOfWork — **Приоритет: High**
+
+**Проблема.** Контракт репозиториев — по одному вызову на сущность (`Interfaces/IRepositories.cs:30,32,47,49,77,79,94,96,109,111,120,122,139,141,154,156,181,183`), никакой транзакции; grep `IUnitOfWork|CommitAsync|BeginTransaction` по репо = 0. Аудит пишется отдельным вызовом после бизнес-записи (`ManagementWires.cs:203-226` → `DepartmentsController.cs:169-171`, `UsersController.cs:266`); в `FinishWorkDayAsync` сначала закрываются перерывы (`WorkTimeService.cs:112`), потом день (`:125`); `AutoFinishWorkDayAsync` пишет день (`:163`) и аудит (`:174-178`) раздельно.
+
+**Влияние/риск.** При ошибке между вызовами остаются «открытые перерывы + закрытый день» и правка без истории BR30; на БД это частично коммитные состояния.
+
+**Решение.** `IUnitOfWork` в Application + реализация на EF (`IDbContextTransaction`, `IsolationLevel.ReadCommitted`) либо один `SaveChangesAsync` на операцию: бизнес-изменение и `AuditLog` в одном коммите. Если аудит должен пережить откат — отдельная транзакция для лога, и это решение зафиксировать явно.
+
+### 6.5 `DateTime.Date`, `TimeSpan` и `ToLower().Contains` не транслируются в SQL на Pomelo — **Приоритет: High**
+
+**Проблема.** Типы сущностей: `DateTime Date`, `TimeSpan StartTime`, `TimeSpan? EndTime` (`Entities.cs:32-35`), `TimeSpan? Duration` (`:48-51`). Сравнения периода идут через `.Date` — фактические места `DevRepositories.WorkTime.cs:146,156,180-181` и `DevRepositories.Support.cs:96,101,125-126` (в лане были цитаты `:178-182`/`:123`, верификатор уточнил строки); «`ToLower().Contains`» в репозиториях не найден. Агрегации считаются в памяти: `ReportService.cs:166,229,270,316,322`.
+
+**Влияние/риск.** В LINQ-to-SQL EF Core 8 на MySQL `DateTime.Date`, `EndTime - StartTime` и агрегации по `TimeSpan` бросают `InvalidOperationException (client evaluation unsupported)` или выгружают весь период в память (3.1).
+
+**Решение.** Дата дня → колонка `DATE` и тип `DateOnly` (EF Core 8 + Pomelo поддерживают) или сравнение `d >= start && d < end.AddDays(1)`; время/длительность → `int` минуты (`start_minute`, `end_minute`, `duration_minutes`) либо `TIME(2)`; суммы через `SUM`/`GroupBy` в SQL (`ExecuteScalarAsync`), а не `TimeSpan` в LINQ.
+
+### 6.6 Смешанные `DateTime.Now` / `DateTime.UtcNow` и `DATETIME` без TZ — **Приоритет: High**
+
+**Проблема.** `DateTime.Now`: `AuthService.cs:57` (окно локаута BR35), `WorkTimeService.cs:175` (AuditLog.Timestamp), `ReportService.cs:98`, `:116` (CreatedAt/UpdatedAt). `DateTime.UtcNow`: `AdminController.cs:84` (ClosedAt), `ReportsController.cs:143`, `ManagementWires.cs:222`, `AuthController.cs:71`, `Middleware.cs:234,270,287,296`, `TokenService.cs:30`, плюс `WorkDaysController.cs:95` (лан не перечислял). Схема хранит `DATETIME` без TZ (`../database/schema.sql:7,25,59,92`). Уточнение верификатора: при записи `Kind` = Local/Utc, `Unspecified` возникает при чтении из `DATETIME`.
+
+**Влияние/риск.** BR35 сравнивает локальное время сервера (MSK) с `LockedUntil`, записанным из `DateTime.Now`, а соседние поля — в UTC: расхождение на 3 часа и на DST; аудит-история смешает локальные и UTC-метки (некорректная сортировка BR29/BR30, см. 3.12); BR23 `ClosedAt` расходится с BR35.
+
+**Решение.** Единый `IClock` (Application) с `UtcNow`, `DateTime.SpecifyKind(..., Utc)` перед записью, хранение `DateTimeOffset` → `DATETIME(6)` в UTC (или `DATETIME(3)` + соглашение «всё в UTC»); расчёт BR3 23:59:59 и BR33 03:00 — в локальной TZ с явной конверцией (см. 8.3).
+
+**Ориентир:** [EF Core — saving and concurrency](https://learn.microsoft.com/en-us/ef/core/saving/concurrency?tabs=data-annotations)
+
+### 6.7 Все query-методы — O(n)-сканы; N+1 на WorkDay→Break — **Приоритет: High**
+
+**Проблема.** `DevRepositories.WorkTime.cs:51-73`, `:76-99`, `:103-136`, `:140-163`; N+1 подтверждён точно: `:245-257` (foreach по `_breaks` + `await _workDays.GetByIdAsync` на `:253`); `DevRepositories.Users.cs:43-63`, `:67-80`, `:83-100`; `DevRepositories.Reports.cs:38-46`, `:103-115`; `DevRepositories.Support.cs:46-70`, `:71-88`, `:90-105`, `:160-175`, `:226-243`, `:244-258`, `:269-276`.
+
+**Влияние/риск.** На БД без индексов каждый метод = full-table scan; N+1 превращается в roundtrip'ы (3.1).
+
+**Решение.** Навигация либо явный join:
+```csharp
+_breaks.Where(b => b.EndTime == null && b.WorkDay.UserId == employeeId)
+```
+Индексы по `user_id`/`work_date`/`status` (+ `Status` для `GetFinishedDaysForPeriodAsync`); `GetFinishedDaysForPeriodAsync` — фильтр по сотрудникам отдела периода, не по всей системе.
+
+### 6.9 Совместимость Domain с EF: нет навигаций и FK-семантики — **Приоритет: Medium**
+
+**Проблема.** Навигационных свойств нет: `WorkDay.UserId`, `Break.WorkDayId`, `Comment.ReportId`, `Absence.UserId`, `PeriodClosure.DepartmentId/ClosedBy/ReopenedByUserId`, `Department.ParentId` — только скалярные FK (`Entities.cs:14,25,31,47,66-67,75,81,108,114`). Домен без ссылки на EF корректен (`WorkTime.Domain.csproj:4-6`), сущности материализуются без изменений (`Entities.cs:7-115`).
+
+**Влияние/риск.** Без навигаций невозможны `Include`, каскады и «один запрос вместо трёх» (см. 6.7); FK-поведение по BR не задано: `Department.ParentId`/`User.DepartmentId` → Restrict (`DepartmentsController.cs:153-167`), `Break.WorkDayId`/`Comment.ReportId`/`Report.WorkDayId` → Cascade, `AuditLog.UserId` лучше Restrict + snapshot имени, иначе удаление аккаунта (BR24, `UsersController.cs:205`) ломает историю BR30.
+
+**Решение.** Добавить navigation (`Department`, `WorkDay`, `Report`) в Domain (не нарушает «Domain без EF») и задать `OnDelete(...)` в `IEntityTypeConfiguration` по BR-карте выше.
+
+### 6.11 Структура Infrastructure и переключение DI — **Приоритет: Medium**
+
+**Проблема.** `InfrastructureLayer.cs:1-14` описывает intended-структуру, но фейки shipped в `WorkTime.Infrastructure` и зарегистрированы как прод (`Program.cs:53-61`); connection string отсутствует (`src/WorkTime.Api/appsettings.json:1-22` — нет `ConnectionStrings:WorkTime`); `ServerVersion` не указан.
+
+**Влияние/риск.** Этап 3 не имеет ни контекста, ни строки подключения, ни места для конфигураций; интеграционные тесты без MySQL не проверяют collation, `DATE` vs `DATETIME` и уникальные индексы.
+
+**Решение.** `src/WorkTime.Infrastructure/Persistence/{ApplicationDbContext, Configurations/*, EfRepositories/*, UnitOfWork}`, `DevRepositories.*` → `tests/WorkTime.Tests`, Api меняет только регистрации (`Program.cs:53-61`); тесты — Docker MySQL (Testcontainers), SQLite только для быстрых unit-тестов репозиториев; `ConnectionStrings:WorkTime` (+ user secrets), `Pooling=True`.
+
+**Ориентир:** [EF Core testing](https://learn.microsoft.com/en-us/ef/core/testing/)
+
+## 7. Тестирование
+
+### 7.1 Unit-тесты проверяют тестовые фейки, боевые репозитории не тестируются — **Приоритет: Medium**
+
+**Проблема.** Unit-тесты работают на `tests/WorkTime.Tests/InMemory*.cs`, интеграционные — на dev-репозитории из `WorkTime.Infrastructure` (`IntegrationApiEndpointsTests.cs:176` строит реальный `WebApplicationFactory<Program>` и меняет только `ILoggerFactory`; `:202,236` берёт репозитории из scope того же приложения). Уточнение верификатора: это не shadowing, а две независимые реализации одних интерфейсов в разных сборках. Тестов репозиториев нет: glob `tests/**/*.cs` → ни одного `*RepositoryTests.cs`.
+
+**Влияние/риск.** Бизнес-правила проверяются на фейках; поведение боевой реализации (сканы, даты, порядок) не покрыто; расхождение двух наборов (1.1) молча живёт.
+
+**Решение.** Один набор фейков (см. 1.1) + contract-тесты репозиториев (`RepositoryContractTests`) на обеим реализациям; на Этапе 3 — те же contract-тесты против EF на Docker MySQL.
+
+**Ориентир:** [ASP.NET Core integration tests (WebApplicationFactory)](https://raw.githubusercontent.com/dotnet/AspNetCore.Docs/main/aspnetcore/test/integration-tests.md)
+
+### 7.2 Тесты подписывают токены development-ключом из репозитория — **Приоритет: Low**
+
+**Проблема.** `IntegrationApiEndpointsTests.cs:176` — новый `WebApplicationFactory` на тест, `ConfigureTestServices` меняет только `ILoggerFactory`; нет `UseEnvironment` и переопределения `JwtSettings`, поэтому токены подписываются ключом из `src/WorkTime.Api/appsettings.json`.
+
+**Влияние/риск.** Тестовый контур закрепляет дефект 2.1 и не проверяет production-валидацию ключа (ни один тест не покрыл отказ на dev-ключе).
+
+**Решение.** В `ConfigureTestServices` — свой `JwtSettings` (коротный тестовый ключ, отдельный от репозитория) и `UseEnvironment("Testing")`; отдельный тест «dev-ключ в Production → throw».
+
+### 7.3 Ноль HTTP-тестов на `/api/departments/*`, экспорты, `/api/audit-logs`, auto-finish, 501 — **Приоритет: Medium**
+
+**Проблема.** В `IntegrationApiEndpointsTests.cs` отделы только сидируются через репозиторий (`:204-207`), HTTP-вызовов нет (6 эндпоинтов с политиками); grep `export|audit-logs|auto-finish` → ноль; 501 `EXPORT_NOT_IMPLEMENTED` (`ReportsController.cs:184-200`) нигде не ассертируется.
+
+**Влияние/риск.** RBAC (БП17/БП22) на отделах и экспортах, BR29/БП29 (audit-logs), BR3 и BR17 на HTTP-уровне не проверены; 501 может незаметно смениться на 200/500.
+
+**Решение.** Добавить интеграционные тесты: departments CRUD по ролям, CSV/xlsx (в т.ч. 501 до Этапа 4), `GET /api/audit-logs` (AdminOnly + paging), auto-finish (в т.ч. BR21 для чужой смены, см. 4.4).
+
+### 7.4 Нет конкурентных тестов — **Приоритет: Medium**
+
+**Проблема.** grep `Task.WhenAll` по `tests` → ноль; гонки описаны в коде (4.2, 3.6) и не проверяются.
+
+**Влияние/риск.** Два активных дня, два отчёта на день, два открытых перерыва, `Dictionary`-гонки — регрессии не ловятся ни до, ни после Этапа 3.
+
+**Решение.** Тесты с `Task.WhenAll` на start/finish/report-upsert/set-absence + на Этапе 3 те же против MySQL (уникальные индексы → ожидаемый BR-код).
+
+### 7.5 Карта покрытия BR: незакрытые правила — **Приоритет: Medium**
+
+**Проблема.** Всего 51 тест (25 unit: `WorkTimeServiceTests.cs` 9 (`:22,69,123,164,207,263,308,370,428`), `BreakServiceTests.cs` 4, `ReportServiceTests.cs` 8, `AuthServiceTests.cs` 4, `AbsenceServiceTests.cs` 4; 26 интеграционных: `IntegrationApiEndpointsTests.cs:326…1227`); roadmap заявляет 55 (25+30) — завышено (`E:\AItest\progcentr\roadmap.md:5`, `:28`). Не покрыты: BR3 (unit есть `WorkTimeServiceTests.cs:370`, триггера нет), BR8/BR9, BR13, BR17, BR18, BR19, BR20, BR23/BR23.1/BR23.2, BR29/BR30, BR31, BR33, BR34, BR36 (BR32 покрыт в обе стороны — `:1183`, `:1228`, `:256`). Уточнения: BR22 частично покрыт (`ReportServiceTests.cs:121`, `IntegrationApiEndpointsTests.cs:738`), не покрыто ровно запрещаемое БП22 — правка руководителем часов и перерывов; BR25 покрыт для Sick (`AbsenceServiceTests.cs:115,121`), Leave (`:174,178`), DayOff (`:60,231`, `Integration:863`) — не покрыт только «прогул».
+
+**Влияние/риск.** Большая часть правил (экспорт, аудит, период, фоновые tasks) без регрессионной защиты; BR35/BR36 role-deviation закреплён ассертом (`AuthServiceTests.cs:109-150`, `api-contracts.md:262,392`) — инверсия требует правки теста и контракта.
+
+**Решение.** Тесты по незакрытым BR + BR-матрица в CI (8.9) как gate; инверсия BR35/BR36 вместе с 2.4.
+
+### 7.6 Манипуляция временем через `FactoryServices`, без `IClock` — **Приоритет: Medium**
+
+**Проблема.** BR32-тесты двигают трекер через сервисы хоста (`IntegrationApiEndpointsTests.cs:186`, `:256`, `:1218`); `IClock` нет; флаккость по часам: `Today => DateTime.UtcNow` (`:166`), `SeedPeriodClosureAsync(DateTime.UtcNow.Year, …Month)` (`:842`, `:1105`).
+
+**Влияние/риск.** Тесты зависят от реального времени и от реализации трекера; в ночь/конец месяца возможны ложные отказты; BR3/BR33 (23:59:59, 03:00) вообще нельзя тестировать без clock-abstraction.
+
+**Решение.** `IClock` в Application, инъекция в `ConfigureTestServices` с fake-clock; сид периодов — от фиксированной даты.
+
+## 8. DevOps и развертывание
+
+### 8.1 Нет контейнеризации: ни Dockerfile, ни compose, ни `.dockerignore` — **Приоритет: Medium**
+
+**Проблема.** glob `**/{Dockerfile*,docker-compose*,.dockerignore}` по `E:\AItest\progcentr` → 0, при том что дорожная карта требует их (`E:\AItest\progcentr\roadmap.md:70` — тестовая БД Docker MySQL, `:95` — README с Docker Compose); `../README.md:1-9` — 9 строк без инструкции запуска.
+
+**Влияние/риск.** Этап 3 (MySQL) и Этап 5 не разворачиваемы: нет образа, нет БД-сервиса, нет readiness/probe, нет воспроизводимого окружения.
+
+**Решение.** Multi-stage образ (`sdk:8.0` → `aspnet:8.0`, non-root, `HEALTHCHECK CMD curl --fail http://localhost:8080/health/live || exit`) + compose с `mysql:8` (healthcheck, volume) и `stop_grace_period`.
+
+**Ориентир:** [ASP.NET Core health checks](https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/health-checks)
+
+### 8.2 Health-checks отсутствуют — **Приоритет: Medium**
+
+**Проблема.** grep `AddHealthChecks|IHealthCheck|MapHealthChecks` = 0; пайплайн `Program.cs:180-195` без `MapHealthChecks`; `/health` нет и в контрактах (grep `health` → 0).
+
+**Влияние/риск.** Compose не может ждать миграций/БД (readiness), `HEALTHCHECK` не работает, restart-политика не отличает «живой, но без БД».
+
+**Решение.**
+```csharp
+builder.Services.AddHealthChecks().AddCheck("self", () => HealthCheckResult.Healthy())
+    .AddMySql(connectionString, name: "mysql", failureStatus: HealthStatus.Degraded);
+app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = r => r.Name == "self" });
+app.MapHealthChecks("/health/ready", new HealthCheckOptions { Predicate = _ => true });
+```
+Пакет `AspNetCore.HealthChecks.MySql` (Pomelo-совместимый), `/health` добавить в контракты.
+
+### 8.3 Часовой пояс не конфигурируется для BR3/BR33 — **Приоритет: Medium**
+
+**Проблема.** Нет TZ-настройки (`appsettings.json` — нет `TimeSettings`); схема хранит `DATETIME` без TZ (`../database/schema.sql:7,25,59,92`) и не задаёт `ENGINE/CHARSET/COLLATE`; БП3 — 23:59:59 (`../docs/business_rules.md:20`), БП33 — 03:00 и 30 дней (`:64`); код считает время в UTC (`Middleware.cs:234`, `:270`, `:287`, `:296`, `WorkDaysController.cs:95`, `AdminController.cs:84`, `ReportsController.cs:143`, `TokenService.cs:30`).
+
+**Влияние/риск.** Фоновый `IHostedService` в контейнере с `TZ=UTC` сработает на 3 часа позже московского времени; бэкап-03:00 и авто-закрытие 23:59:59 расходятся с правилом (связано с 6.6).
+
+**Решение.**
+```csharp
+builder.Services.Configure<TimeSettings>(builder.GetSection("TimeSettings")); // TimeZoneId = Europe/Moscow
+var localNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.FindSystemTimeZoneById(cfg.TimeZoneId));
+```
+Хранить всё в UTC, локальное расписание — через `TimeZoneInfo` явно; в compose задавать `TZ` только как данные конфигурации, не как поведение.
+
+### 8.4 Логирование: console-only, без correlation id и метрик — **Приоритет: Medium**
+
+**Проблема.** `Program.cs:47-49` — `ClearProviders()` + `AddConfiguration` + `AddConsole()`, единственный sink plain-text; `Middleware.cs:291-296` — `{Method} {Path} -> {Status} in {ElapsedMs} ms` без `TraceIdentifier`/correlation id (grep = 0); Serilog/OpenTelemetry = 0; секция `EventLog: None` (`appsettings.json:15-19`) имеет смысл только на Windows; метрик (req/s, доля 401, латентность) нет; Console-провайдер сериализует записи через внутренний lock — узкое место на high RPS (L3 2.4).
+
+**Влияние/риск.** ELK/Splunk/Grafana не принимают такие строки; запрос нельзя склеить с логами ошибки и с trace; BR-отказы (5.8) невидимы.
+
+**Решение.** Serilog JSON в консоль (`Enrich.FromLogContext()`, `application` property, `userId`/`entityId`/BR-код), `TraceIdentifier` как correlation id в начале pipeline, OpenTelemetry ASP.NET metrics; request-log уровень `Debug`, чтобы не писать каждый 2xx.
+
+### 8.6 Нет CI/CD и анализаторов — **Приоритет: Medium**
+
+**Проблема.** glob `**/.github/*`, `.gitlab-ci.yml`, `azure-pipelines.yml` = 0; в csproj нет `Microsoft.CodeAnalysis.NetAnalyzers`, `EnforceCodeStyleInBuild`, `TreatWarningsAsErrors` (grep по `*.csproj` = 0); `WorkTime.Api.csproj:14-18` сам указывает, что сборку делает пользователь.
+
+**Влияние/риск.** Никто не прогоняет restore/build/test/format и не проверяет регрессии BR1..BR36; null-warnings и стиль копятся (5.6).
+
+**Решение.** Пайплайн: `dotnet restore` → `dotnet format --verify-changes` → `dotnet build -c Release` → `dotnet test` (+ coverage gate) → `dotnet ef migrations`/`database update` (Этап 3) → `docker build` + Trivy.
+
+### 8.8 CORS не настроен вообще — **Приоритет: Medium**
+
+**Проблема.** grep `AddCors|UseCors|ICorsPolicyBuilder|PolicyName` по `src` → ноль совпадений; в конвейере `Program.cs:180-193` CORS-middleware отсутствует, origins нигде не конфигурируются (`appsettings.json:1-22`). Для SPA на другом origin любой запрос (в т.ч. `POST /api/auth/login`) упирается в CORS-политику браузера, а «быстрый фикс» обычно делается через `AllowAnyOrigin` + `AllowAnyHeader`.
+
+**Влияние/риск.** Клиент на отдельном origin неработоспособен до Этапа 5; при включении `AllowAnyOrigin` с Bearer-аутентификацией расширяется поверхность перебора (усиливает 2.2/2.3) и исчезает контроль источников. Внешний ориентир не указан — страницу не сверял, выдуманный URL здесь не нужен.
+
+**Решение.** `builder.Services.AddCors(o => o.AddPolicy("spa", p => p.WithOrigins(cfg.ClientOrigins).WithHeaders("Authorization", "Content-Type").WithMethods("GET", "POST", "PUT", "DELETE")))` + `app.UseCors("spa")` до `UseAuthorization()`; список origins — из конфигурации (`ClientSettings:Origins`), не `AllowAnyOrigin`. Реализация — на Этапе 5 вместе с `api.env.example`.
+
+### 8.9 Лимит тела запроса не задан — **Приоритет: Medium**
+
+**Проблема.** grep `MaxRequestBodySize|RequestSizeLimit` по `src/**/*.cs` = 0; дефолт Kestrel 30 MB; контракты лимит не фиксируют. POST с большим телом + Argon2id (`PasswordHasher.cs:25,100-103`) = amplification-DoS (усиливает 2.2).
+
+**Влияние/риск.** 30 MB на порядки больше нужного для `{login,password}` и для payload отчёта; memory/CPU-усилитель.
+
+**Решение.** `builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 64 * 1024)` (или `[RequestSizeLimit(65536)]` на POST-экшенах) и зафиксировать лимит + 413 в контрактах.
+
+## Что обязательно исправить до старта Этапа 3
+
+1. Убрать dev-ключ из `appsettings.json` и добавить fail-fast на него вне Development (2.1).
+2. Перенос InMemory-фейков из `WorkTime.Infrastructure` в tests и регистрация БД-репозиториев как прод (1.1).
+3. Переключить lifetimes DI: `AddDbContext` + scoped репозитории вместо 9 singleton (6.1).
+4. Убрать `.GetAwaiter().GetResult()` под глобальными замками (3.2, 3.3).
+5. Заменить TOCTOU-SELECT на уникальные индексы + translate `DbUpdateException` в BR-коды (6.2, 4.2).
+6. Добавить `RowVersion`/conditional UPDATE и атомарный инкремент счётчика BR35 (6.3, 4.5).
+7. Один `SaveChangesAsync`/`IUnitOfWork` на бизнес-операцию вместе с аудитом (6.4).
+8. Перевести типы времени в SQL-совместимые (`DateOnly`/`DATE`, минуты как `int`) и единый `IClock` + UTC (6.5, 6.6).
+9. Переписать месячный отчёт на один запрос с группировкой и пачечным fetch перерывов (3.1).
+10. Owner-gate в `FinishBreakAsync` и `AutoFinishWorkDayAsync` + BR21 в контракт (4.1, 4.4).
+11. Rate limiting на `/api/auth/login` (2.2).
+12. Отзываемость/сверка `IsActive` и роли по БД вместо доверия claims (2.7).
+13. `UseHttpsRedirection`/`UseHsts` + `UseHostFiltering` (2.9).
+14. Остальные High до Этапа 3: BR32 resurrection после prune (2.6), серверная проверка капчи BR36 (2.5), owner-gate чужого отчёта + логирование БП23 (2.8), BR3 авто-закрытие 23:59:59 (4.3), БП12/БП23 правки часов и перерывов (4.7), блокировка редактирования закрытого периода (4.8), валидация отрицательной длительности (4.9), гонки plain `Dictionary` (3.6), in-memory состояние на 2+ инстансах (3.7), O(n)-сканы и N+1 на EF (6.7).
+## Что можно отложить на Этап 3/4
+
+- Гейты `EntityMutationGates` — удалить вместе с переходом на EF (1.4); статический `AuditTrail` → `IAuditTrail`; логирование в Application-сервисах (5.8).
+- Разделение god-классов (`Wire.cs`, `Middleware.cs`, `ReportService.cs`, `ManagementWires.cs`); DTO как immutable `record` + wire-enum вместо доменных (5.5) вместе с выбором DTO/wire-контракта (1.3).
+- Удаление мёртвого `GetAllByIdsAsync` (5.1), триады обвязки в 35 action'ах (5.2), дубль POST/PUT отсутствий (5.3), двойного wire-маппинга (5.4); два механизма валидации → один (DataAnnotations + envelope).
+- Политика пароля и `MaxLength` текстовых полей (2.12); аутентификационные события в audit log (2.13); фиксированные сообщения model-state вместо эха имён полей.
+- Мелкие perf и граничные BR: `Enum.GetValues` на запрос, материализация «есть ли дети/сотрудники», дублирующееся чтение субъекта в запросе; BR16 (деактивированный в месячной таблице), BR9 граница `>=`/`>` и уведомление, BR8 список перерывов <5 мин, гонки BR10 и закрытия перерывов вне lock, `can-start` для руководителя, автор BR30 при auto-finish, локализация «прогул» — всё отложено на Этап 3/4.
+- EF-детали и тестовая инфраструктура: навигации и FK-семантика по BR (6.9), `enum`/`TimeSpan`/`HasMaxLength` + `utf8mb4`, сид как `IDataSeedInitializer`, имена таблиц/casing/collation; contract-тесты репозиториев, fake `IClock` вместо `FactoryServices` (7.6), ассерты формы отказа (`error.code`, `WWW-Authenticate`) и приведение roadmap к фактическим 51 тестам.
+- DevOps мелочи: `ForwardedHeaders` (нужен для partition rate limiter), CORS origins для SPA (8.8 — CORS не настроен вообще, ни `AddCors`, ни `UseCors`; нужен ограниченный список origins, а не `AllowAnyOrigin`), README + `api.env.example` + `UserSecretsId`, `stop_grace_period` в compose, лимит тела 64 KB.
+- Контейнеризация и наблюдаемость Этапа 3/4: Dockerfile + docker-compose с MySQL (8.1), `AddHealthChecks` + `/health/live` и `/health/ready` (8.2), `TZ`/NTP и `UseUserTimeZone` (8.3), структурированное логирование с correlation id и метриками (8.4), CI/CD pipeline с coverage-gate и анализаторы + NRT-warnings as errors (8.6, 5.6).
+- Негативные и интеграционные тесты: единый текст отказа и выравнивание времени на `/login` (2.3), тесты боевых репозиториев и конкурентные тесты (7.1, 7.3, 7.4), карта покрытия BR (7.5), переопределение ключа и `UseEnvironment` в `WebApplicationFactory` (7.2).
+- Пагинация, упорядочение и bounding аудита по БП29 (3.5, 3.12), проброс `CancellationToken` в EF (3.4), use-case сервисы в Application (1.2) и выбор DTO/wire-контракта (1.3), auto-генерация отчёта по БП14 (4.6).
+
+## Что проверено и признано корректным
+
+- Direction of dependency: Domain без зависимостей, Application → только Domain (+Argon2, `WorkTime.Application.csproj:9`), Infrastructure → Application+Domain, Api как композиционный корень; обратных стрелок нет (`*.csproj`).
+- Все флаги валидации JWT включены (`ValidateIssuer/Audience/Lifetime/IssuerSigningKey`), Issuer/Audience точные, `ClockSkew` = 1 мин (`TokenService.cs:80-92`, `:71`); derivation ключа идентичен на签发 и валидации (`TokenService.cs:33-34` vs `:77-78`); `NameClaimType`/`RoleClaimType` совпадают с claims и `RolesAuthorizationRequirement`.
+- `DefaultPolicy`/`FallbackPolicy` = `DenyAnonymousAuthorizationRequirement` — анонимен только `POST /api/auth/login` (`AuthController.cs:40-41`); `[Authorize]` на классах WorkDays/Breaks/Reports/Absences (`WorkDaysController.cs:16`, `BreaksController.cs:14`, `ReportsController.cs:16`, `AbsencesController.cs:16`).
+- Идентичность всегда из субъекта токена, никогда из тела (`Identity.cs:13-15`, `WorkDaysController.cs:51,72,89,121`, `BreaksController.cs:41,61`, `ReportsController.cs:52,101,120`); `can-start` и чтение чужих отсутствий отказывают (`WorkDaysController.cs:141`, `AbsencesController.cs:91`); daily-отчёт по чужому employeeId отказывает (`ReportService.cs:145`); правка отчёта после закрытия дня — только Admin (`ReportService.cs:107`).
+- Пароли: Argon2id v=19, `m=19456` KiB, `t=2`, `p=1` (`PasswordHasher.cs:10-14`), соль 16 байт CSPRNG на каждый hash (`:27`), hash 32 байта, PHC-строка, `FixedTimeEquals` (`:91`), верхние границы параметров против Doon чужой строки (`:17-23`), null-пароль не бросает исключение; открытый пароль и `PasswordHash` наружу не отдаются.
+- Порядок конвейера корректен: exception handler → request logging → Swagger → authentication → BR32 → authorization (`Program.cs:180-193`).
+- `UserActivityTracker` потокобезопасен (`ConcurrentDictionary` + `lock` на prune, `Middleware.cs:154-204`), память ограниченна prune по окну BR32, утечки нет; успешный login сбрасывает baseline (`AuthController.cs:71`).
+- Контракты репозиториев полностью async и с `CancellationToken` в каждой сигнатуре — архитектурная база для EF-этапа правильная (`IRepositories.cs:10-33` и далее); middleware-пайплайн асинхронный, записи ответа с `RequestAborted` (`Middleware.cs:102`, `:258`); `Thread.Sleep`/`Task.Delay` нет.
+- WorkDay/Break репозитории уже на `ConcurrentDictionary` (`DevRepositories.WorkTime.cs:16`, `:189`) — эталон для остальных; JWT stateless (HS256) — авторизация масштабируется горизонтально.
+- Конец месяца через `firstOfNextMonth.AddDays(-1)` (`ReportService.cs:343-347`) и inclusive `>=`/`<=` по датам (`DevRepositories.WorkTime.cs:181`, `DevRepositories.Support.cs:126`) — декабрь и високосный февраль корректны; удаление отдела 409 при детях/сотрудниках (`DepartmentsController.cs:139-175`).
+- Интеграционный контур работает: `Microsoft.AspNetCore.Mvc.Testing` (`tests/WorkTime.Tests/WorkTime.Tests.csproj:18`) и `public partial class Program {}` (`Program.cs:242`) для `WebApplicationFactory<Program>`; BR32 покрыт в обе стороны (`IntegrationApiEndpointsTests.cs:1183`, `:1228`).
+- БП35/БП36: ролевой гейт `lockRulesApply = Admin || Manager` (`AuthService.cs:107`) **соответствует** требованиям — `.dsh-switchman/business-requirements.md:65-66`: «(работает только для руковода и админа)», `api-contracts.md:262` — «manager/admin only». Поведение Employee (не блокируется, капча не запрашивается) корректно и закреплено `AuthServiceTests.cs:109-150`.
+
+**Переметка:** 27 записей скорректировано (27 понижен, 0 повышен). Коррекция после сверки с требованиями: находка 2.4 снята как ошибочная (БП35/БП36 ограничены ролями руковода и админа), находка 4.1 повышена до Critical. Итог: Critical — 4, High — 24, Medium — 35, Low — 2 (всего 65).

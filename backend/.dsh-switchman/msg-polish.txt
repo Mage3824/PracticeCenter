@@ -1,0 +1,5 @@
+fix(stage-2): единый null-ответ /work-days/current и границы параметров Argon2id
+
+1. GET /api/work-days/current без открытой смены возвращает 200 с literal null и application/json, как GET /api/reports/daily
+2. Ассерты интеграционных тестов проверяют тело "null" и content-type на всех пяти вызовах /work-days/current
+3. PasswordHasher: null пароль больше не бросает exception, при сверке проверяется v=19, параметры m/t/p ограничены (m <= 65536 KiB, t <= 10, p <= 16), длина соли и хеша проверяется до вычисления

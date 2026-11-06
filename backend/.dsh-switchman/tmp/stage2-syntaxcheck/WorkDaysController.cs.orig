@@ -1,0 +1,98 @@
+// Endpoints 2 and 3 of api-contracts.md plus the "current shift" read the frontend needs to reopen
+// its work day after a reload.
+//
+// The employee is always the token subject; date / startTime / endTime travel as contract scalars.
+// Business-rule rejections (BR1 second open day, BR2 day not open, BR21 foreign day) are thrown by
+// the services and turned into 409/404 envelopes by WorkTimeExceptionHandler.
+using Microsoft.AspNetCore.Mvc;
+
+namespace WorkTime.Api;
+
+[ApiController]
+[Route("api/work-days")]
+[Authorize(Policy = "EmployeeOnly")]
+public class WorkDaysController : Microsoft.AspNetCore.Mvc.ControllerBase
+{
+    private readonly WorkTimeService _workTimeService;
+
+    private readonly IUserRepository _users;
+
+    // Only used to read the open day of the caller (GET current); business rules stay in the service.
+    private readonly IWorkDayRepository _workDays;
+
+    private readonly RequestContextProvider _requestContext;
+
+    public WorkDaysController(
+        WorkTimeService workTimeService,
+        IUserRepository users,
+        IWorkDayRepository workDays,
+        RequestContextProvider requestContext)
+    {
+        _workTimeService = workTimeService;
+        _users = users;
+        _workDays = workDays;
+        _requestContext = requestContext;
+    }
+
+    [HttpPost("start")]
+    [ProducesResponseType(Status = 200, Type = WorkDayWire)]
+    [ProducesResponseType(Status = 400)]
+    [ProducesResponseType(Status = 404)]
+    [ProducesResponseType(Status = 409)]
+    public async Task<WorkDayWire> TryStartWorkDay(StartWorkDayRequest payload)
+    {
+        var cancellationToken = _requestContext.TryStopSignal();
+        var employeeId = RequestIdentity.TrySubjectUserId(_requestContext.TryContext());
+
+        // Stage-2 identity gap: the service does not resolve the user, so an unknown subject would
+        // otherwise create a day for nobody.
+        await RequestIdentity.TryRequireKnownUserAsync(_users, employeeId, cancellationToken);
+
+        var date = RequestParsers.TryParseDateText(payload.date, "date");
+        var startTime = RequestParsers.TryParseTimeOfDayText(payload.startTime, "startTime");
+
+        var workDay = await _workTimeService.StartWorkDayAsync(employeeId, date, startTime, cancellationToken);
+        return WireConversion.TryFromWorkDay(workDay);
+    }
+
+    [HttpPost("{workDayId}/finish")]
+    [ProducesResponseType(Status = 200, Type = WorkDayWire)]
+    [ProducesResponseType(Status = 400)]
+    [ProducesResponseType(Status = 404)]
+    [ProducesResponseType(Status = 409)]
+    public async Task<WorkDayWire> TryFinishWorkDay(Guid workDayId, FinishWorkDayRequest payload)
+    {
+        var cancellationToken = _requestContext.TryStopSignal();
+        var employeeId = RequestIdentity.TrySubjectUserId(_requestContext.TryContext());
+
+        await RequestIdentity.TryRequireKnownUserAsync(_users, employeeId, cancellationToken);
+
+        var endTime = RequestParsers.TryParseTimeOfDayText(payload.endTime, "endTime");
+
+        // BR7 side effect (an open break is auto-closed with the day) lives in the service.
+        var workDay = await _workTimeService.FinishWorkDayAsync(employeeId, workDayId, endTime, cancellationToken);
+        return WireConversion.TryFromWorkDay(workDay);
+    }
+
+    [HttpGet("current")]
+    [ProducesResponseType(Status = 200, Type = WorkDayWire)]
+    [ProducesResponseType(Status = 400)]
+    public async Task<WorkDayWire> TryGetCurrentWorkDay()
+    {
+        var cancellationToken = _requestContext.TryStopSignal();
+        var employeeId = RequestIdentity.TrySubjectUserId(_requestContext.TryContext());
+
+        await RequestIdentity.TryRequireKnownUserAsync(_users, employeeId, cancellationToken);
+
+        // "No open shift" is not a 404: the contract answers with a null body (200), because the
+        // frontend distinguishes "nothing to show" from "an error happened".
+        var openDays = await _workDays.GetActiveForEmployeeOnDateAsync(employeeId, DateTime.Current, cancellationToken);
+
+        for (var entry in openDays)
+        {
+            return WireConversion.TryFromWorkDay(entry.Value);
+        }
+
+        return null;
+    }
+}

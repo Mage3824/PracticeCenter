@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Ключ подписи JWT не хранится в репозитории (аудит 2.1): для локального запуска он
+         задаётся через dotnet user-secrets, например
+         dotnet user-secrets set "JwtSettings:SecretKey" "<ключ>". -->
+    <UserSecretsId>WorkTime.Api-Development</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WorkTime.Application\WorkTime.Application.csproj" />
+    <ProjectReference Include="..\WorkTime.Infrastructure\WorkTime.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <!--
+    Both packages are declared explicitly so the intent is visible in the source tree.
+    Neither of them is in the local NuGet cache (see solutions.md), so resolving them needs
+    network access at build time - the user performs the build.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.4" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.4.0" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,4 @@
+feat(security): BR34 — односторонний хеш пароля на Argon2id с PHC-форматом
+
+1. PasswordHasher.cs переведён на Argon2id (Konscious) с параметрами OWASP и PHC-строкой, сверка читает параметры из хранимой строки
+2. PackageReference Konscious.Security.Cryptography.Argon2 1.3.1 добавлен в WorkTime.Application.csproj

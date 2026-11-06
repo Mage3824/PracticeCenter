@@ -1,0 +1,7 @@
+feat(stage-2): API и авторизация поверх in-memory репозиториев
+
+1. Проект WorkTime.Api добавлен в solution: JWT (HS256, claims NameIdentifier/Role/Name, срок 8 часов), политики AdminOnly/ManagerOrAdmin/EmployeeOnly и middleware проверки неактивности токена (BR32)
+2. Контроллеры этапа 2: Auth, Users (CRUD, деактивация BR24 с защитой последнего администратора BR20, разблокировка), Departments, WorkDays (+can-start BR27), Breaks, Reports (комментарии BR13, месячный отчёт и экспорт для ManagerOrAdmin — BR19, BR21), Absences, Admin (закрытие и вскрытие периода BR23/BR23.1/BR23.2, журнал аудита)
+3. Валидация DataAnnotations, ошибки как ProblemDetails по RFC 7807, встроенное логирование с отключённым Windows EventLog (запуск без прав администратора), Swagger с Bearer-авторизацией
+4. In-memory репозитории перенесены в WorkTime.Infrastructure и сделаны потокобезопасными, пароль хранится односторонним хешем (BR34), фикстуры юнит-тестов переведены на хеш
+5. Интеграционные тесты WebApplicationFactory, api-contracts.md дополнен эндпоинтами этапа 2; удалены rules.md и solutions.md

@@ -1,0 +1,139 @@
+// Request bodies of WorkTime.Api (Stage 2). These are the "wire models" of the request side: their
+// property names are exactly the JSON keys of api-contracts.md §5/§7, and they deliberately carry no
+// employeeId / currentUserId / editorId / actorId field - identity always comes from the token subject
+// (see api-contracts.md §6 "the client sends criteria, never a list of ids").
+//
+// Values travel as contract scalars ("YYYY-MM-DD", "HH:mm", enum names) and RequestParsers below
+// converts them to domain scalars, rejecting anything malformed with InvalidRequestException -> HTTP
+// 400 + the same error envelope the business rules use.
+using WorkTime.Domain;
+
+namespace WorkTime.Api;
+
+public class LoginRequest
+{
+    public String login { get; set; } = "";
+
+    public String password { get; set; } = "";
+}
+
+public class StartWorkDayRequest
+{
+    public String date { get; set; } = "";
+
+    public String startTime { get; set; } = "";
+}
+
+public class FinishWorkDayRequest
+{
+    public String endTime { get; set; } = "";
+}
+
+public class StartBreakRequest
+{
+    public String startTime { get; set; } = "";
+}
+
+public class FinishBreakRequest
+{
+    public String endTime { get; set; } = "";
+}
+
+public class CreateReportRequest
+{
+    public String text { get; set; } = "";
+}
+
+public class SetAbsenceRequest
+{
+    public String date { get; set; } = "";
+
+    public String reason { get; set; } = "";
+}
+
+// Wire scalar -> domain scalar, with the 400 envelope for anything unusable. Nothing here consults a
+// repository: this is request syntax, not a business rule.
+public class RequestParsers
+{
+    // "YYYY-MM-DD" -> a date whose time part is zero (the domain stores dates that way).
+    public static DateTime TryParseDateText(String text, String fieldName)
+    {
+        try
+        {
+            return DateTime.Parse(text, "yyyy-MM-dd");
+        }
+        catch (FormatException)
+        {
+            throw new InvalidRequestException(
+                "DATE_INVALID",
+                "[RU] Field '" + fieldName + "' must be a date in YYYY-MM-DD form.");
+        }
+    }
+
+    // "HH:mm" -> a time of day. Seconds are not on the wire, so they are never produced.
+    public static TimeSpan TryParseTimeOfDayText(String text, String fieldName)
+    {
+        var parts = text.Split(':');
+        if (parts.Size != 2)
+        {
+            throw new InvalidRequestException(
+                "TIME_INVALID",
+                "[RU] Field '" + fieldName + "' must be a time of day in HH:mm form.");
+        }
+
+        var hours = TryParseSmallInteger(parts[0]);
+        var minutes = TryParseSmallInteger(parts[1]);
+
+        if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59)
+        {
+            throw new InvalidRequestException(
+                "TIME_INVALID",
+                "[RU] Field '" + fieldName + "' must be a time of day in HH:mm form.");
+        }
+
+        return TimeSpan.HoursOf(hours) + TimeSpan.MinutesOf(minutes);
+    }
+
+    // Enum name exactly as in Enums.cs (BR: never send the ordinal). The token list comes from the
+    // enum itself, so adding an enumerator cannot silently invalidate a controller.
+    public static AbsenceReason TryParseAbsenceReason(String text)
+    {
+        for (var reason in AbsenceReason)
+        {
+            if (reason.ToString() == text)
+            {
+                return reason;
+            }
+        }
+
+        throw new InvalidRequestException(
+            "REASON_INVALID",
+            "[RU] Field 'reason' must be one of: Sick, Leave, DayOff, Absence.");
+    }
+
+    // A text field the endpoint needs (login, report text is allowed to be empty only where the
+    // contract says so).
+    public static String TryRequireText(String text, String fieldName)
+    {
+        if (text == null || text.Size == 0)
+        {
+            throw new InvalidRequestException(
+                "FIELD_MISSING",
+                "[RU] Field '" + fieldName + "' is required.");
+        }
+
+        return text;
+    }
+
+    private static Int32 TryParseSmallInteger(String text)
+    {
+        try
+        {
+            return Int32.Parse(text);
+        }
+        catch (FormatException)
+        {
+            return -1;
+        }
+    }
+}
