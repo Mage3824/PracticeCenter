@@ -109,6 +109,12 @@ public interface IReportRepository
     Task SaveAsync(Report report, CancellationToken cancellationToken);
 
     Task DeleteAsync(Guid id, CancellationToken cancellationToken);
+
+    
+    // Получить все сохранённые отчёты
+    Task<IEnumerable<Report>> GetAllAsync(
+        CancellationToken cancellationToken);
+
 }
 
 public interface ICommentRepository

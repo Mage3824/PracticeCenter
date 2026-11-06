@@ -100,6 +100,7 @@ public partial class Program
         builder.Services.AddScoped<WorkTimeService>();
         builder.Services.AddScoped<BreakService>();
         builder.Services.AddScoped<ReportService>();
+        builder.Services.AddScoped<ReportSearchService>();
         builder.Services.AddScoped<AbsenceService>();
 
         // TokenService issues the JWT of a successful login; it reads the same settings singleton.

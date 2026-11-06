@@ -59,6 +59,16 @@ public class InMemoryReportRepository : IReportRepository
         _reports.Remove(id);
         return Task.CompletedTask;
     }
+
+    
+    // Возвращает копию списка отчётов
+    public Task<IEnumerable<Report>> GetAllAsync(
+        CancellationToken cancellationToken)
+    {
+        IEnumerable<Report> result = _reports.Values.ToList();
+        return Task.FromResult(result);
+    }
+
 }
 
 // In-memory implementation of ICommentRepository. Comment stores ReportId (not WorkDayId), so

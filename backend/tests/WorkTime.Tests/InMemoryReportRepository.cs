@@ -56,4 +56,13 @@ public class InMemoryReportRepository : IReportRepository
         _reports.Remove(id);
         return Task.CompletedTask;
     }
+
+    
+    public Task<IEnumerable<Report>> GetAllAsync(
+        CancellationToken cancellationToken)
+    {
+        IEnumerable<Report> result = _reports.Values.ToList();
+        return Task.FromResult(result);
+    }
+
 }
